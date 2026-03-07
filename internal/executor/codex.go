@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-proxy/internal/auth"
@@ -40,8 +41,9 @@ const (
  * @field httpClient - 共享的 HTTP 客户端（连接池复用）
  */
 type Executor struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL       string
+	httpClient    *http.Client
+	keepAliveOnce sync.Once
 }
 
 /**
@@ -57,10 +59,10 @@ func NewExecutor(baseURL, proxyURL string) *Executor {
 	}
 
 	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		MaxConnsPerHost:     50,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 50,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     300 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
 	}
@@ -235,19 +237,19 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, account *auth.Account, 
 		return nil, &StatusError{Code: httpResp.StatusCode, Body: errBody}
 	}
 
-	/* 读取完整响应 */
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-
-	/* 提取 usage 统计 */
-	extractUsageFromSSE(data, account)
-
-	/* 从 SSE 数据中找到 response.completed 事件并转换 */
+	/*
+	 * 边读边找 response.completed 事件，找到即返回
+	 * 不等完整 SSE 流结束，大幅减少非流式请求的等待时间
+	 */
 	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
+	scanner := bufio.NewScanner(httpResp.Body)
+	scanner.Buffer(nil, 52_428_800)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		/* 提取流式 usage */
+		extractUsageFromStreamLine(line, account)
+
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
@@ -259,6 +261,10 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, account *auth.Account, 
 		if result != "" {
 			return []byte(result), nil
 		}
+	}
+
+	if err = scanner.Err(); err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 
 	return nil, fmt.Errorf("未收到 response.completed 事件")
@@ -325,27 +331,26 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, account *auth.Acc
 
 	flusher, canFlush := writer.(http.Flusher)
 
-	/* 直接透传 SSE 事件，不做格式转换 */
-	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		/* 提取流式 usage */
-		extractUsageFromStreamLine(line, account)
-		if len(line) == 0 {
-			_, _ = fmt.Fprint(writer, "\n")
-		} else {
-			_, _ = fmt.Fprintf(writer, "%s\n", line)
+	/*
+	 * 直接字节级实时转发，不经过 Scanner 缓冲
+	 * 每读到一块数据立即写入客户端并 Flush，实现真正的实时转发
+	 */
+	buf := make([]byte, 8192)
+	for {
+		n, readErr := httpResp.Body.Read(buf)
+		if n > 0 {
+			_, _ = writer.Write(buf[:n])
+			if canFlush {
+				flusher.Flush()
+			}
 		}
-		if canFlush {
-			flusher.Flush()
+		if readErr != nil {
+			if readErr != io.EOF {
+				log.Errorf("读取流式响应失败: %v", readErr)
+				return readErr
+			}
+			break
 		}
-	}
-
-	if err = scanner.Err(); err != nil {
-		log.Errorf("读取流式响应失败: %v", err)
-		return err
 	}
 
 	return nil
@@ -402,18 +407,17 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, account *auth.
 		return nil, &StatusError{Code: httpResp.StatusCode, Body: errBody}
 	}
 
-	/* 读取完整响应 */
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
+	/*
+	 * 边读边找 response.completed 事件，找到即返回
+	 * 不等完整 SSE 流结束，大幅减少非流式请求的等待时间
+	 */
+	scanner := bufio.NewScanner(httpResp.Body)
+	scanner.Buffer(nil, 52_428_800)
 
-	/* 提取 usage 统计 */
-	extractUsageFromSSE(data, account)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		extractUsageFromStreamLine(line, account)
 
-	/* 从 SSE 数据中找到 response.completed 事件，提取 response 对象 */
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
@@ -427,7 +431,218 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, account *auth.
 		}
 	}
 
+	if err = scanner.Err(); err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
 	return nil, fmt.Errorf("未收到 response.completed 事件")
+}
+
+/**
+ * ExecuteResponsesCompactStream 执行 Responses Compact API 流式请求
+ * 使用 /responses/compact 端点，直接透传 Codex SSE 事件到客户端
+ *
+ * @param ctx - 上下文
+ * @param account - 使用的账号
+ * @param requestBody - Responses API 格式的请求体
+ * @param model - 模型名称（可能含思考后缀）
+ * @param writer - HTTP 响应写入器
+ * @returns error - 执行失败时返回错误
+ */
+func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, account *auth.Account, requestBody []byte, model string, writer http.ResponseWriter) error {
+	/* 应用思考配置并获取真实模型名 */
+	body, baseModel := thinking.ApplyThinking(requestBody, model)
+
+	/* Responses API 格式已经很接近 Codex 格式，使用通用转换器处理 */
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
+	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
+	if !gjson.GetBytes(codexBody, "instructions").Exists() {
+		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
+	}
+
+	/* 构建 HTTP 请求 - 使用 /responses/compact 端点 */
+	apiURL := e.baseURL + "/responses/compact"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	applyCodexHeaders(httpReq, account, true)
+
+	/* 发送请求 */
+	httpResp, err := e.httpClient.Do(httpReq)
+	if err != nil {
+		account.RecordFailure()
+		return fmt.Errorf("请求发送失败: %w", err)
+	}
+	defer func() {
+		_ = httpResp.Body.Close()
+	}()
+
+	/* 处理错误状态码 */
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(httpResp.Body)
+		log.Errorf("Codex Compact API 错误 [%d]: %s", httpResp.StatusCode, summarizeError(errBody))
+		handleAccountError(account, httpResp.StatusCode, errBody)
+		return &StatusError{Code: httpResp.StatusCode, Body: errBody}
+	}
+
+	/* 透传响应头 */
+	for k, vs := range httpResp.Header {
+		for _, v := range vs {
+			writer.Header().Add(k, v)
+		}
+	}
+	writer.WriteHeader(http.StatusOK)
+
+	flusher, canFlush := writer.(http.Flusher)
+
+	/* 直接透传响应体（SSE 或 CBOR 等 compact 格式） */
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := httpResp.Body.Read(buf)
+		if n > 0 {
+			_, _ = writer.Write(buf[:n])
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	return nil
+}
+
+/**
+ * ExecuteResponsesCompactNonStream 执行 Responses Compact API 非流式请求
+ * 使用 /responses/compact 端点，返回 compact 格式的完整响应
+ *
+ * @param ctx - 上下文
+ * @param account - 使用的账号
+ * @param requestBody - Responses API 格式的请求体
+ * @param model - 模型名称（可能含思考后缀）
+ * @returns []byte - compact 格式的完整响应
+ * @returns error - 执行失败时返回错误
+ */
+func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, account *auth.Account, requestBody []byte, model string) ([]byte, error) {
+	/* 应用思考配置 */
+	body, baseModel := thinking.ApplyThinking(requestBody, model)
+
+	/* 转换请求格式 */
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, false)
+	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
+	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
+	if !gjson.GetBytes(codexBody, "instructions").Exists() {
+		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
+	}
+
+	/* 构建并发送请求 - 使用 /responses/compact 端点 */
+	apiURL := e.baseURL + "/responses/compact"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	applyCodexHeaders(httpReq, account, false)
+
+	httpResp, err := e.httpClient.Do(httpReq)
+	if err != nil {
+		account.RecordFailure()
+		return nil, fmt.Errorf("请求发送失败: %w", err)
+	}
+	defer func() {
+		_ = httpResp.Body.Close()
+	}()
+
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(httpResp.Body)
+		handleAccountError(account, httpResp.StatusCode, errBody)
+		return nil, &StatusError{Code: httpResp.StatusCode, Body: errBody}
+	}
+
+	/* 读取完整响应并直接返回（compact 格式透传） */
+	data, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	return data, nil
+}
+
+/**
+ * RawResponse 原始上游响应封装
+ * @field StatusCode - HTTP 状态码
+ * @field Body - 响应体（调用方负责关闭）
+ * @field ErrBody - 错误时的响应体（StatusCode >= 300 时有值）
+ */
+type RawResponse struct {
+	StatusCode int
+	Body       io.ReadCloser
+	ErrBody    []byte
+}
+
+/**
+ * ExecuteRawCodexStream 发送请求到 Codex 并返回原始上游响应
+ * 不做任何格式转换，由调用方自行处理响应体
+ * 用于 Claude API 等需要自定义响应格式的场景
+ *
+ * @param ctx - 上下文
+ * @param account - 使用的账号
+ * @param requestBody - OpenAI Chat Completions 格式的请求体
+ * @param model - 模型名称（可能含思考后缀）
+ * @returns *RawResponse - 原始响应（成功时调用方需关闭 Body）
+ * @returns error - 请求发送失败时返回错误
+ */
+func (e *Executor) ExecuteRawCodexStream(ctx context.Context, account *auth.Account, requestBody []byte, model string) (*RawResponse, error) {
+	/* 应用思考配置 */
+	body, baseModel := thinking.ApplyThinking(requestBody, model)
+
+	/* 转换请求格式 */
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
+	codexBody, _ = sjson.SetBytes(codexBody, "stream", true)
+	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
+	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
+	if !gjson.GetBytes(codexBody, "instructions").Exists() {
+		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
+	}
+
+	/* 构建并发送请求 */
+	apiURL := e.baseURL + "/responses"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	applyCodexHeaders(httpReq, account, true)
+
+	httpResp, err := e.httpClient.Do(httpReq)
+	if err != nil {
+		account.RecordFailure()
+		return nil, fmt.Errorf("请求发送失败: %w", err)
+	}
+
+	/* 错误状态码：读取错误体并返回 */
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		handleAccountError(account, httpResp.StatusCode, errBody)
+		return &RawResponse{StatusCode: httpResp.StatusCode, ErrBody: errBody}, &StatusError{Code: httpResp.StatusCode, Body: errBody}
+	}
+
+	/* 成功：返回原始响应体，调用方负责关闭 */
+	return &RawResponse{StatusCode: httpResp.StatusCode, Body: httpResp.Body}, nil
 }
 
 /**
@@ -483,15 +698,15 @@ func handleAccountError(account *auth.Account, statusCode int, body []byte) {
 }
 
 /**
- * ShouldRemoveAccount 判断此错误是否应该导致账号被删除（内存+磁盘）
- * 仅 401（认证失效）认为是账号永久失效，需要删除
- * 403（地域封锁/Cloudflare 拦截）、400（请求参数错误）、429（限频）、5xx（服务端问题）均不删号
+ * ShouldRemoveAccount 判断此错误是否应该导致账号被立即删除（内存+磁盘）
+ * 401（认证失效）现在由 Manager.HandleAuth401 异步处理（先冷却+后台刷新），不在此处直接删除
+ * 403（地域封锁/Cloudflare 拦截）、400（参数错误）、429（限频）、5xx（服务端）均不删号
  * @param statusCode - HTTP 状态码
- * @returns bool - 是否应该删除
+ * @returns bool - 是否应该立即删除
  */
 func ShouldRemoveAccount(statusCode int) bool {
-	/* 仅 401 认证失效才删除账号 */
-	return statusCode == 401
+	/* 401 由 HandleAuth401 异步处理，此处不再直接删除 */
+	return false
 }
 
 /**
@@ -602,4 +817,63 @@ func extractUsageFromStreamLine(line []byte, account *auth.Account) {
 	outputTokens := usage.Get("output_tokens").Int()
 	totalTokens := usage.Get("total_tokens").Int()
 	account.RecordUsage(inputTokens, outputTokens, totalTokens)
+}
+
+/**
+ * StartKeepAlive 启动连接池保活循环
+ * 每隔固定时间向上游发送轻量级 HEAD 请求，防止空闲连接被回收
+ * 解决长时间无请求后首次请求因重建 TCP+TLS 连接而耗时过长的问题
+ * 使用 sync.Once 保证只启动一次
+ * @param ctx - 上下文，用于控制生命周期
+ */
+func (e *Executor) StartKeepAlive(ctx context.Context) {
+	e.keepAliveOnce.Do(func() {
+		go func() {
+			/* 每 60 秒 ping 一次上游，保持连接池热度 */
+			ticker := time.NewTicker(60 * time.Second)
+			defer ticker.Stop()
+
+			pingURL := strings.TrimSuffix(e.baseURL, "/codex")
+			if pingURL == "" {
+				pingURL = "https://chatgpt.com"
+			}
+
+			log.Infof("连接保活已启动，每 60 秒 ping %s", pingURL)
+
+			for {
+				select {
+				case <-ctx.Done():
+					log.Debug("连接保活循环已停止")
+					return
+				case <-ticker.C:
+					e.pingUpstream(pingURL)
+				}
+			}
+		}()
+	})
+}
+
+/**
+ * pingUpstream 向上游发送轻量级 HEAD 请求保持连接池活跃
+ * 忽略响应结果，仅为维持 TCP+TLS 连接
+ * @param targetURL - 目标 URL
+ */
+func (e *Executor) pingUpstream(targetURL string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, targetURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("Connection", "Keep-Alive")
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		log.Debugf("连接保活 ping 失败: %v", err)
+		return
+	}
+	_ = resp.Body.Close()
+	log.Debugf("连接保活 ping 成功: %d", resp.StatusCode)
 }

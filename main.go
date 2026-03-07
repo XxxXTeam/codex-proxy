@@ -73,9 +73,14 @@ func main() {
 	}
 	manager.SetRefreshConcurrency(cfg.RefreshConcurrency)
 
-	/* 启动后台 Token 刷新 */
+	/* 启动后台任务 */
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	/* 启动异步磁盘写入工作器（将 Token 写盘从刷新 goroutine 解耦） */
+	manager.StartSaveWorker(ctx)
+
+	/* 启动后台 Token 刷新 */
 	go manager.StartRefreshLoop(ctx)
 
 	/* 启动健康检查（如果配置了检查间隔） */
@@ -91,6 +96,9 @@ func main() {
 
 	/* 初始化执行器 */
 	exec := executor.NewExecutor(cfg.BaseURL, cfg.ProxyURL)
+
+	/* 启动连接池保活（防止长时间无请求后首次请求耗时过长） */
+	exec.StartKeepAlive(ctx)
 
 	/* 初始化 HTTP 服务 */
 	if cfg.LogLevel != "debug" {

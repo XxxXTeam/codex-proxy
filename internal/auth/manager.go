@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -35,11 +36,13 @@ type Manager struct {
 	mu                 sync.RWMutex
 	accounts           []*Account
 	accountIndex       map[string]*Account
+	accountsPtr        atomic.Pointer[[]*Account] /* 原子快照，Pick 热路径零锁读取 */
 	refresher          *Refresher
 	selector           Selector
 	authDir            string
 	refreshInterval    int
 	refreshConcurrency int
+	saveQueue          chan *Account /* 异步磁盘写入队列 */
 	stopCh             chan struct{}
 }
 
@@ -55,7 +58,7 @@ func NewManager(authDir, proxyURL string, refreshInterval int, selector Selector
 	if selector == nil {
 		selector = NewRoundRobinSelector()
 	}
-	return &Manager{
+	m := &Manager{
 		accounts:           make([]*Account, 0, 1024),
 		accountIndex:       make(map[string]*Account, 1024),
 		refresher:          NewRefresher(proxyURL),
@@ -63,8 +66,12 @@ func NewManager(authDir, proxyURL string, refreshInterval int, selector Selector
 		authDir:            authDir,
 		refreshInterval:    refreshInterval,
 		refreshConcurrency: defaultRefreshConcurrency,
+		saveQueue:          make(chan *Account, 4096),
 		stopCh:             make(chan struct{}),
 	}
+	empty := make([]*Account, 0)
+	m.accountsPtr.Store(&empty)
+	return m
 }
 
 /**
@@ -115,6 +122,7 @@ func (m *Manager) LoadAccounts() error {
 
 	m.accounts = accounts
 	m.accountIndex = index
+	m.publishSnapshot()
 	log.Infof("共加载 %d 个 Codex 账号", len(accounts))
 	return nil
 }
@@ -177,10 +185,8 @@ func loadAccountFromFile(filePath string) (*Account, error) {
  * @returns error - 没有可用账号时返回错误
  */
 func (m *Manager) Pick(model string) (*Account, error) {
-	m.mu.RLock()
-	accounts := m.accounts
-	m.mu.RUnlock()
-
+	/* 原子指针读取，零锁 */
+	accounts := *m.accountsPtr.Load()
 	return m.selector.Pick(model, accounts)
 }
 
@@ -193,14 +199,13 @@ func (m *Manager) Pick(model string) (*Account, error) {
  * @returns error - 没有可用账号时返回错误
  */
 func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Account, error) {
-	m.mu.RLock()
-	allAccounts := m.accounts
-	m.mu.RUnlock()
+	/* 原子指针读取，零锁 */
+	allAccounts := *m.accountsPtr.Load()
 	if len(excluded) == 0 {
 		return m.selector.Pick(model, allAccounts)
 	}
 
-	filtered := make([]*Account, 0, len(allAccounts))
+	filtered := make([]*Account, 0, len(allAccounts)-len(excluded))
 	for _, acc := range allAccounts {
 		if !excluded[acc.FilePath] {
 			filtered = append(filtered, acc)
@@ -219,10 +224,10 @@ func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Accoun
  * @returns []*Account - 账号列表
  */
 func (m *Manager) GetAccounts() []*Account {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make([]*Account, len(m.accounts))
-	copy(result, m.accounts)
+	/* 原子快照是不可变的，可安全直接返回 */
+	snap := *m.accountsPtr.Load()
+	result := make([]*Account, len(snap))
+	copy(result, snap)
 	return result
 }
 
@@ -231,9 +236,7 @@ func (m *Manager) GetAccounts() []*Account {
  * @returns int - 账号数量
  */
 func (m *Manager) AccountCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.accounts)
+	return len(*m.accountsPtr.Load())
 }
 
 /**
@@ -266,6 +269,7 @@ func (m *Manager) RemoveAccount(acc *Account, reason string) {
 	}
 
 	remaining := len(m.accounts)
+	m.publishSnapshot()
 	m.mu.Unlock()
 
 	/* 删除磁盘文件 */
@@ -323,6 +327,59 @@ func (m *Manager) Stop() {
 }
 
 /**
+ * publishSnapshot 将当前 accounts 切片发布为原子快照
+ * 必须在持有 m.mu 写锁时调用
+ */
+func (m *Manager) publishSnapshot() {
+	snap := make([]*Account, len(m.accounts))
+	copy(snap, m.accounts)
+	m.accountsPtr.Store(&snap)
+}
+
+/**
+ * StartSaveWorker 启动异步磁盘写入工作器
+ * 从 saveQueue 中消费账号，批量将 Token 写入磁盘
+ * 将磁盘 IO 从刷新 goroutine 中解耦，避免阻塞并发刷新
+ * @param ctx - 上下文，用于控制生命周期
+ */
+func (m *Manager) StartSaveWorker(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				/* 退出前排空队列 */
+				for {
+					select {
+					case acc := <-m.saveQueue:
+						_ = m.saveTokenToFile(acc)
+					default:
+						return
+					}
+				}
+			case acc := <-m.saveQueue:
+				if err := m.saveTokenToFile(acc); err != nil {
+					log.Errorf("异步保存 Token 失败 [%s]: %v", acc.GetEmail(), err)
+				}
+			}
+		}
+	}()
+}
+
+/**
+ * enqueueSave 将账号加入异步磁盘写入队列
+ * 非阻塞：队列满时丢弃（下次刷新会重新写入）
+ * @param acc - 要保存的账号
+ */
+func (m *Manager) enqueueSave(acc *Account) {
+	select {
+	case m.saveQueue <- acc:
+	default:
+		/* 队列满，跳过此次写入，不阻塞刷新 goroutine */
+		log.Debugf("磁盘写入队列已满，跳过 [%s]", acc.GetEmail())
+	}
+}
+
+/**
  * scanNewFiles 扫描 auth 目录，加载新增的账号文件到号池
  * 已存在的文件不会重复加载，已被移除的也不会重新加入（直到文件变更）
  */
@@ -366,6 +423,10 @@ func (m *Manager) scanNewFiles() {
 	}
 
 	if newCount > 0 {
+		/* 发布新快照 */
+		m.mu.Lock()
+		m.publishSnapshot()
+		m.mu.Unlock()
 		log.Infof("热加载: 新增 %d 个账号，当前总计 %d 个", newCount, m.AccountCount())
 	}
 }
@@ -376,22 +437,28 @@ func (m *Manager) scanNewFiles() {
  * @param ctx - 上下文
  */
 func (m *Manager) refreshAllAccountsConcurrent(ctx context.Context) {
-	m.mu.RLock()
-	accounts := make([]*Account, len(m.accounts))
-	copy(accounts, m.accounts)
-	m.mu.RUnlock()
-
+	/* 使用原子快照，零锁 */
+	accounts := *m.accountsPtr.Load()
 	if len(accounts) == 0 {
 		return
 	}
 
+	/* 先过滤出需要刷新的账号，避免为不需要刷新的账号创建 goroutine */
+	needRefresh := m.filterNeedRefresh(accounts)
+
 	start := time.Now()
-	log.Infof("开始并发刷新 %d 个账号（并发 %d）", len(accounts), m.refreshConcurrency)
+	log.Infof("开始并发刷新: 总 %d 个账号，需刷新 %d 个（并发 %d）",
+		len(accounts), len(needRefresh), m.refreshConcurrency)
+
+	if len(needRefresh) == 0 {
+		log.Info("所有账号 Token 均有效，跳过刷新")
+		return
+	}
 
 	sem := make(chan struct{}, m.refreshConcurrency)
 	var wg sync.WaitGroup
 
-	for _, acc := range accounts {
+	for _, acc := range needRefresh {
 		if ctx.Err() != nil {
 			break
 		}
@@ -407,7 +474,57 @@ func (m *Manager) refreshAllAccountsConcurrent(ctx context.Context) {
 	}
 
 	wg.Wait()
-	log.Infof("刷新完成: %d 个账号，耗时 %v，剩余 %d 个", len(accounts), time.Since(start).Round(time.Millisecond), m.AccountCount())
+	log.Infof("刷新完成: 刷新 %d 个账号，耗时 %v，剩余 %d 个",
+		len(needRefresh), time.Since(start).Round(time.Millisecond), m.AccountCount())
+}
+
+/**
+ * filterNeedRefresh 过滤出需要刷新的账号
+ * 跳过条件：
+ *   - Token 还有 5 分钟以上有效期
+ *   - 最近 60 秒内已经刷新过
+ *   - 正在被其他 goroutine 刷新中
+ * @param accounts - 全部账号列表
+ * @returns []*Account - 需要刷新的账号列表
+ */
+func (m *Manager) filterNeedRefresh(accounts []*Account) []*Account {
+	nowMs := time.Now().UnixMilli()
+	result := make([]*Account, 0, len(accounts)/2)
+
+	for _, acc := range accounts {
+		/* 正在刷新中，跳过 */
+		if acc.refreshing.Load() != 0 {
+			continue
+		}
+
+		/* 最近 60 秒内已刷新过，跳过 */
+		if lastMs := acc.lastRefreshMs.Load(); lastMs > 0 && (nowMs-lastMs) < 60_000 {
+			continue
+		}
+
+		/* 检查 Token 过期时间 */
+		acc.mu.RLock()
+		expire := acc.Token.Expire
+		refreshToken := acc.Token.RefreshToken
+		acc.mu.RUnlock()
+
+		if refreshToken == "" {
+			continue
+		}
+
+		/* Token 还有 5 分钟以上有效期，跳过 */
+		if expire != "" {
+			if expireTime, parseErr := time.Parse(time.RFC3339, expire); parseErr == nil {
+				if time.Until(expireTime) > 5*time.Minute {
+					continue
+				}
+			}
+		}
+
+		result = append(result, acc)
+	}
+
+	return result
 }
 
 /**
@@ -448,10 +565,8 @@ func (m *Manager) ForceRefreshAllStream(ctx context.Context, quotaChecker *Quota
 	go func() {
 		defer close(ch)
 
-		m.mu.RLock()
-		accounts := make([]*Account, len(m.accounts))
-		copy(accounts, m.accounts)
-		m.mu.RUnlock()
+		/* 原子快照读取，零锁 */
+		accounts := *m.accountsPtr.Load()
 
 		total := len(accounts)
 		if total == 0 {
@@ -468,8 +583,7 @@ func (m *Manager) ForceRefreshAllStream(ctx context.Context, quotaChecker *Quota
 
 		sem := make(chan struct{}, m.refreshConcurrency)
 		var wg sync.WaitGroup
-		var successCount, failCount, current int64
-		var mu sync.Mutex
+		var successCount, failCount, currentIdx atomic.Int64
 
 		for _, acc := range accounts {
 			if ctx.Err() != nil {
@@ -488,18 +602,16 @@ func (m *Manager) ForceRefreshAllStream(ctx context.Context, quotaChecker *Quota
 				/* 刷新成功后同时查询额度 */
 				if ok && quotaChecker != nil {
 					quotaChecker.CheckOne(ctx, a)
+					a.RefreshUsedPercent()
 				}
 
 				email := a.GetEmail()
-				mu.Lock()
-				current++
-				cur := int(current)
+				cur := int(currentIdx.Add(1))
 				if ok {
-					successCount++
+					successCount.Add(1)
 				} else {
-					failCount++
+					failCount.Add(1)
 				}
-				mu.Unlock()
 
 				ch <- ProgressEvent{
 					Type:    "item",
@@ -514,16 +626,18 @@ func (m *Manager) ForceRefreshAllStream(ctx context.Context, quotaChecker *Quota
 		wg.Wait()
 
 		remaining := m.AccountCount()
+		sc := successCount.Load()
+		fc := failCount.Load()
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Infof("手动刷新完成: 成功 %d, 失败 %d, 耗时 %v, 剩余 %d 个",
-			successCount, failCount, elapsed, remaining)
+			sc, fc, elapsed, remaining)
 
 		ch <- ProgressEvent{
 			Type:         "done",
 			Message:      "刷新完成",
 			Total:        total,
-			SuccessCount: int(successCount),
-			FailedCount:  int(failCount),
+			SuccessCount: int(sc),
+			FailedCount:  int(fc),
 			Remaining:    remaining,
 			Duration:     elapsed.String(),
 		}
@@ -539,6 +653,13 @@ func (m *Manager) ForceRefreshAllStream(ctx context.Context, quotaChecker *Quota
  * @returns bool - 刷新是否成功
  */
 func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
+	/* CAS 去重：防止同一账号被多个刷新源同时刷新 */
+	if !acc.refreshing.CompareAndSwap(0, 1) {
+		log.Debugf("账号 [%s] 正在刷新中，跳过强制刷新", acc.GetEmail())
+		return true /* 正在刷新中视为成功 */
+	}
+	defer acc.refreshing.Store(0)
+
 	acc.mu.RLock()
 	refreshToken := acc.Token.RefreshToken
 	email := acc.Token.Email
@@ -559,12 +680,62 @@ func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
 
 	acc.UpdateToken(*td)
 
-	if saveErr := m.saveTokenToFile(acc); saveErr != nil {
-		log.Errorf("账号 [%s] Token 保存失败: %v", email, saveErr)
-	} else {
-		log.Infof("账号 [%s] Token 刷新成功", td.Email)
-	}
+	/* 异步写盘，不阻塞刷新 goroutine */
+	m.enqueueSave(acc)
+	log.Infof("账号 [%s] Token 刷新成功", td.Email)
 	return true
+}
+
+/**
+ * HandleAuth401 处理请求返回 401 的账号
+ * 先将账号设为短暂冷却（立即从可用池中排除），然后后台异步刷新 Token
+ * 刷新成功：恢复为 active 状态，账号重新可用
+ * 刷新失败：从号池和磁盘中彻底删除该账号
+ * 该方法是非阻塞的，不影响当前请求的响应速度
+ * @param acc - 返回 401 的账号
+ */
+func (m *Manager) HandleAuth401(acc *Account) {
+	email := acc.GetEmail()
+
+	/* 立即设为冷却状态，防止后续请求继续使用该账号 */
+	acc.SetCooldown(30 * time.Second)
+	log.Warnf("账号 [%s] 遇到 401，已临时冷却，后台刷新中...", email)
+
+	/* CAS 去重：防止同一账号被多个刷新源同时刷新 */
+	if !acc.refreshing.CompareAndSwap(0, 1) {
+		log.Debugf("账号 [%s] 已在刷新中，跳过 401 后台刷新", email)
+		return
+	}
+
+	/* 后台异步刷新 Token */
+	go func() {
+		defer acc.refreshing.Store(0)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		acc.mu.RLock()
+		refreshToken := acc.Token.RefreshToken
+		acc.mu.RUnlock()
+
+		if refreshToken == "" {
+			log.Warnf("账号 [%s] 无 refresh_token，直接删除", email)
+			m.RemoveAccount(acc, ReasonAuth401)
+			return
+		}
+
+		td, err := m.refresher.RefreshTokenWithRetry(ctx, refreshToken, 2)
+		if err != nil {
+			log.Errorf("账号 [%s] 后台刷新失败，从号池删除: %v", email, err)
+			m.RemoveAccount(acc, ReasonAuth401)
+			return
+		}
+
+		/* 刷新成功，更新 Token 并恢复为 active */
+		acc.UpdateToken(*td)
+		m.enqueueSave(acc)
+		log.Infof("账号 [%s] 后台刷新成功，已恢复可用", td.Email)
+	}()
 }
 
 /**
@@ -575,31 +746,21 @@ func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
  * @param acc - 要刷新的账号
  */
 func (m *Manager) refreshAccount(ctx context.Context, acc *Account) {
+	/* CAS 去重：防止同一账号被多个刷新源同时刷新 */
+	if !acc.refreshing.CompareAndSwap(0, 1) {
+		log.Debugf("账号 [%s] 正在刷新中，跳过", acc.GetEmail())
+		return
+	}
+	defer acc.refreshing.Store(0)
+
 	acc.mu.RLock()
 	refreshToken := acc.Token.RefreshToken
 	email := acc.Token.Email
-	expire := acc.Token.Expire
 	acc.mu.RUnlock()
 
 	if refreshToken == "" {
 		log.Warnf("账号 [%s] 缺少 refresh_token，移除", email)
 		m.RemoveAccount(acc, "missing_refresh_token")
-		return
-	}
-
-	/* 检查 Token 是否即将过期，提前刷新 */
-	needRefresh := true
-	if expire != "" {
-		expireTime, parseErr := time.Parse(time.RFC3339, expire)
-		if parseErr == nil {
-			if time.Until(expireTime) > 5*time.Minute {
-				needRefresh = false
-			}
-		}
-	}
-
-	if !needRefresh {
-		log.Debugf("账号 [%s] Token 仍有效，跳过刷新", email)
 		return
 	}
 
@@ -615,12 +776,9 @@ func (m *Manager) refreshAccount(ctx context.Context, acc *Account) {
 	/* 更新内存中的 Token */
 	acc.UpdateToken(*td)
 
-	/* 原子写入磁盘 */
-	if saveErr := m.saveTokenToFile(acc); saveErr != nil {
-		log.Errorf("账号 [%s] Token 保存失败: %v", email, saveErr)
-	} else {
-		log.Infof("账号 [%s] Token 刷新成功", td.Email)
-	}
+	/* 异步写盘，不阻塞刷新 goroutine */
+	m.enqueueSave(acc)
+	log.Infof("账号 [%s] Token 刷新成功", td.Email)
 }
 
 /**

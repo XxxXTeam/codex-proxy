@@ -49,16 +49,16 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p dist
-          cp "$BINARY" dist/
-          cp config.example.yaml dist/config.yaml
-          cp README.md dist/
-          mkdir -p dist/auths
           ARCHIVE="codex-proxy-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p staging/auths
+          cp "$BINARY" staging/
+          cp config.example.yaml staging/config.yaml
+          cp LICENSE staging/
+          cp README.md staging/
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            cd dist && zip -r "../${ARCHIVE}.zip" . && cd ..
+            cd staging && zip -r "../${ARCHIVE}.zip" * && cd ..
           else
-            tar -czf "${ARCHIVE}.tar.gz" -C dist .
+            tar -czf "${ARCHIVE}.tar.gz" -C staging .
           fi
 
       - name: Upload Artifact

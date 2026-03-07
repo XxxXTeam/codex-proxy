@@ -92,6 +92,15 @@ type Account struct {
 	TotalCompletions    atomic.Int64
 	QuotaInfo           *QuotaInfo
 	QuotaCheckedAt      time.Time
+
+	/* 原子状态字段（热路径无锁读取） */
+	atomicStatus     atomic.Int32 /* 存储 AccountStatus 枚举值 */
+	atomicCooldownMs atomic.Int64 /* 存储 CooldownUntil 的 UnixMilli */
+	atomicUsedPct    atomic.Int64 /* 存储 usedPercent * 100（定点数），-100 表示未知 */
+
+	/* 刷新去重字段 */
+	refreshing    atomic.Int32 /* CAS 标志：0=空闲，1=正在刷新。防止同一账号被重复刷新 */
+	lastRefreshMs atomic.Int64 /* 上次刷新完成时间戳（UnixMilli），用于快速判断是否需要刷新 */
 }
 
 /**
@@ -179,14 +188,16 @@ type QuotaInfo struct {
  * @returns bool - 如果账号状态为 active 或冷却已过则返回 true
  */
 func (a *Account) IsAvailable() bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	if a.Status == StatusDisabled {
+	/* 使用原子字段无锁判断，避免热路径上的锁竞争 */
+	status := AccountStatus(a.atomicStatus.Load())
+	if status == StatusDisabled {
 		return false
 	}
-	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUntil) {
-		return false
+	if status == StatusCooldown {
+		cooldownMs := a.atomicCooldownMs.Load()
+		if time.Now().UnixMilli() < cooldownMs {
+			return false
+		}
 	}
 	return true
 }
@@ -226,12 +237,17 @@ func (a *Account) GetEmail() string {
  * @param td - 新的 Token 数据
  */
 func (a *Account) UpdateToken(td TokenData) {
+	now := time.Now()
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.Token = td
-	a.LastRefreshedAt = time.Now()
+	a.LastRefreshedAt = now
 	a.Status = StatusActive
 	a.LastError = nil
+	a.mu.Unlock()
+
+	/* 同步更新原子状态 */
+	a.atomicStatus.Store(int32(StatusActive))
+	a.lastRefreshMs.Store(now.UnixMilli())
 }
 
 /**
@@ -239,10 +255,15 @@ func (a *Account) UpdateToken(td TokenData) {
  * @param duration - 冷却持续时间
  */
 func (a *Account) SetCooldown(duration time.Duration) {
+	until := time.Now().Add(duration)
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.Status = StatusCooldown
-	a.CooldownUntil = time.Now().Add(duration)
+	a.CooldownUntil = until
+	a.mu.Unlock()
+
+	/* 同步更新原子状态 */
+	a.atomicStatus.Store(int32(StatusCooldown))
+	a.atomicCooldownMs.Store(until.UnixMilli())
 }
 
 /**
@@ -250,12 +271,18 @@ func (a *Account) SetCooldown(duration time.Duration) {
  * @param duration - 冷却持续时间
  */
 func (a *Account) SetQuotaCooldown(duration time.Duration) {
+	until := time.Now().Add(duration)
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.Status = StatusCooldown
-	a.CooldownUntil = time.Now().Add(duration)
+	a.CooldownUntil = until
 	a.QuotaExhausted = true
-	a.QuotaResetsAt = time.Now().Add(duration)
+	a.QuotaResetsAt = until
+	a.mu.Unlock()
+
+	/* 同步更新原子状态 */
+	a.atomicStatus.Store(int32(StatusCooldown))
+	a.atomicCooldownMs.Store(until.UnixMilli())
+	a.atomicUsedPct.Store(10000) /* 100.00% */
 }
 
 /**
@@ -264,9 +291,11 @@ func (a *Account) SetQuotaCooldown(duration time.Duration) {
  */
 func (a *Account) SetDisabled(err error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.Status = StatusDisabled
 	a.LastError = err
+	a.mu.Unlock()
+
+	a.atomicStatus.Store(int32(StatusDisabled))
 }
 
 /**
@@ -276,10 +305,12 @@ func (a *Account) SetDisabled(err error) {
  */
 func (a *Account) SetDisabledWithReason(err error, reason string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.Status = StatusDisabled
 	a.LastError = err
 	a.DisableReason = reason
+	a.mu.Unlock()
+
+	a.atomicStatus.Store(int32(StatusDisabled))
 }
 
 /**
@@ -287,13 +318,17 @@ func (a *Account) SetDisabledWithReason(err error, reason string) {
  */
 func (a *Account) SetActive() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.Status = StatusActive
 	a.LastError = nil
 	a.ConsecutiveFailures = 0
 	a.DisableReason = ReasonNone
 	a.QuotaExhausted = false
 	a.QuotaResetsAt = time.Time{}
+	a.mu.Unlock()
+
+	/* 同步更新原子状态 */
+	a.atomicStatus.Store(int32(StatusActive))
+	a.atomicCooldownMs.Store(0)
 }
 
 /**
@@ -336,22 +371,37 @@ func (a *Account) RecordUsage(inputTokens, outputTokens, totalTokens int64) {
  * @returns float64 - 使用率（0-100），-1 表示未知
  */
 func (a *Account) GetUsedPercent() float64 {
+	/* 直接从原子字段读取，无锁 */
+	v := a.atomicUsedPct.Load()
+	return float64(v) / 100.0
+}
+
+/**
+ * RefreshUsedPercent 从 QuotaInfo 重新计算并更新原子缓存的 usedPercent
+ * 在额度查询完成后调用，避免排序时逐个加锁解析 JSON
+ */
+func (a *Account) RefreshUsedPercent() {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
+	exhausted := a.QuotaExhausted
+	qi := a.QuotaInfo
+	a.mu.RUnlock()
 
-	if a.QuotaExhausted {
-		return 100
+	if exhausted {
+		a.atomicUsedPct.Store(10000) /* 100.00% */
+		return
 	}
-	if a.QuotaInfo == nil || !a.QuotaInfo.Valid || len(a.QuotaInfo.RawData) == 0 {
-		return -1
+	if qi == nil || !qi.Valid || len(qi.RawData) == 0 {
+		a.atomicUsedPct.Store(-100) /* -1.00 → 未知 */
+		return
 	}
 
-	/* 从 raw_data 中解析 used_percent */
-	result := gjson.GetBytes(a.QuotaInfo.RawData, "rate_limit.primary_window.used_percent")
+	result := gjson.GetBytes(qi.RawData, "rate_limit.primary_window.used_percent")
 	if !result.Exists() {
-		return -1
+		a.atomicUsedPct.Store(-100)
+		return
 	}
-	return result.Float()
+	/* 存储为定点数：percent * 100 */
+	a.atomicUsedPct.Store(int64(result.Float() * 100))
 }
 
 /**
