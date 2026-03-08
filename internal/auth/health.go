@@ -60,10 +60,15 @@ func NewHealthChecker(baseURL, proxyURL string, checkInterval int, maxFailures i
 	}
 
 	transport := &http.Transport{
-		MaxIdleConns:        concurrency * 2,
-		MaxIdleConnsPerHost: concurrency,
-		IdleConnTimeout:     90 * time.Second,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
+		MaxIdleConns:          concurrency * 2,
+		MaxIdleConnsPerHost:   concurrency * 2,
+		MaxConnsPerHost:       concurrency * 2,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		ForceAttemptHTTP2:     true,
+		DisableCompression:    true,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
 	}
 
 	if proxyURL != "" {

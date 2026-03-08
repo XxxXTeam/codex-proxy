@@ -41,7 +41,17 @@ type Refresher struct {
  */
 func NewRefresher(proxyURL string) *Refresher {
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   200, /* auth.openai.com 单主机，需要大连接池 */
+		MaxConnsPerHost:       200,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		WriteBufferSize:       4 * 1024,
+		ReadBufferSize:        8 * 1024,
+		ForceAttemptHTTP2:     true,
+		DisableCompression:    true,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
 	}
 
 	if proxyURL != "" {

@@ -343,26 +343,30 @@ func (m *Manager) publishSnapshot() {
  * @param ctx - 上下文，用于控制生命周期
  */
 func (m *Manager) StartSaveWorker(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				/* 退出前排空队列 */
-				for {
-					select {
-					case acc := <-m.saveQueue:
-						_ = m.saveTokenToFile(acc)
-					default:
-						return
+	/* 启动多个写入 goroutine 并行消费队列，加速 2w+ 账号的磁盘写入 */
+	const saveWorkers = 4
+	for i := 0; i < saveWorkers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					/* 退出前排空队列 */
+					for {
+						select {
+						case acc := <-m.saveQueue:
+							_ = m.saveTokenToFile(acc)
+						default:
+							return
+						}
+					}
+				case acc := <-m.saveQueue:
+					if err := m.saveTokenToFile(acc); err != nil {
+						log.Errorf("异步保存 Token 失败 [%s]: %v", acc.GetEmail(), err)
 					}
 				}
-			case acc := <-m.saveQueue:
-				if err := m.saveTokenToFile(acc); err != nil {
-					log.Errorf("异步保存 Token 失败 [%s]: %v", acc.GetEmail(), err)
-				}
 			}
-		}
-	}()
+		}()
+	}
 }
 
 /**
