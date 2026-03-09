@@ -692,16 +692,20 @@ func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
 
 	td, err := m.refresher.RefreshTokenWithRetry(ctx, refreshToken, 3)
 	if err != nil {
-		log.Errorf("账号 [%s] Token 刷新失败，从号池移除: %v", email, err)
+		/* 429 限频：设冷却而不是删除 */
+		if IsRateLimitRefreshErr(err) {
+			acc.SetCooldown(60 * time.Second)
+			log.Warnf("账号 [%s] 刷新限频 429，冷却 60s", email)
+			return false
+		}
+		log.Warnf("账号 [%s] 刷新失败，移除: %v", email, err)
 		m.RemoveAccount(acc, ReasonRefreshFailed)
 		return false
 	}
 
 	acc.UpdateToken(*td)
-
-	/* 异步写盘，不阻塞刷新 goroutine */
 	m.enqueueSave(acc)
-	log.Infof("账号 [%s] Token 刷新成功", td.Email)
+	log.Infof("账号 [%s] 刷新成功", td.Email)
 	return true
 }
 
@@ -745,7 +749,13 @@ func (m *Manager) HandleAuth401(acc *Account) {
 
 		td, err := m.refresher.RefreshTokenWithRetry(ctx, refreshToken, 2)
 		if err != nil {
-			log.Errorf("账号 [%s] 后台刷新失败，从号池删除: %v", email, err)
+			/* 429 限频：设冷却而不是删除 */
+			if IsRateLimitRefreshErr(err) {
+				acc.SetCooldown(60 * time.Second)
+				log.Warnf("账号 [%s] 401 后台刷新限频 429，冷却 60s", email)
+				return
+			}
+			log.Warnf("账号 [%s] 后台刷新失败，移除: %v", email, err)
 			m.RemoveAccount(acc, ReasonAuth401)
 			return
 		}
@@ -787,17 +797,20 @@ func (m *Manager) refreshAccount(ctx context.Context, acc *Account) {
 
 	td, err := m.refresher.RefreshTokenWithRetry(ctx, refreshToken, 3)
 	if err != nil {
-		log.Errorf("账号 [%s] Token 刷新失败，从号池移除: %v", email, err)
+		/* 429 限频：设冷却而不是删除 */
+		if IsRateLimitRefreshErr(err) {
+			acc.SetCooldown(60 * time.Second)
+			log.Warnf("账号 [%s] 刷新限频 429，冷却 60s", email)
+			return
+		}
+		log.Warnf("账号 [%s] 刷新失败，移除: %v", email, err)
 		m.RemoveAccount(acc, ReasonRefreshFailed)
 		return
 	}
 
-	/* 更新内存中的 Token */
 	acc.UpdateToken(*td)
-
-	/* 异步写盘，不阻塞刷新 goroutine */
 	m.enqueueSave(acc)
-	log.Infof("账号 [%s] Token 刷新成功", td.Email)
+	log.Infof("账号 [%s] 刷新成功", td.Email)
 }
 
 /**

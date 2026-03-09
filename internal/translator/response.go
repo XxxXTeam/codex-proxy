@@ -25,6 +25,10 @@ var dataPrefix = []byte("data:")
  * @field FunctionCallIndex - 当前函数调用的索引
  * @field HasReceivedArgsDelta - 是否已接收到函数参数增量
  * @field HasToolCallAnnounced - 是否已发送过工具调用通知
+ * @field baseTpl - 预构建的基础 JSON 模板（id/created/model 已设置，避免每事件重复构建）
+ * @field UsageInput - response.completed 时提取的 input_tokens
+ * @field UsageOutput - response.completed 时提取的 output_tokens
+ * @field UsageTotal - response.completed 时提取的 total_tokens
  */
 type StreamState struct {
 	ResponseID           string
@@ -33,6 +37,10 @@ type StreamState struct {
 	FunctionCallIndex    int
 	HasReceivedArgsDelta bool
 	HasToolCallAnnounced bool
+	baseTpl              string
+	UsageInput           int64
+	UsageOutput          int64
+	UsageTotal           int64
 }
 
 /**
@@ -75,41 +83,31 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 
 	root := gjson.ParseBytes(rawJSON)
 	dataType := root.Get("type").String()
-
-	/* response.created 事件只缓存元数据，不输出 */
 	if dataType == "response.created" {
 		state.ResponseID = root.Get("response.id").String()
 		state.CreatedAt = root.Get("response.created_at").Int()
 		if m := root.Get("response.model").String(); m != "" {
 			state.Model = m
 		}
+		tpl := `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null}]}`
+		tpl, _ = sjson.Set(tpl, "id", state.ResponseID)
+		tpl, _ = sjson.Set(tpl, "created", state.CreatedAt)
+		tpl, _ = sjson.Set(tpl, "model", state.Model)
+		state.baseTpl = tpl
 		return nil
 	}
 
-	/* 初始化 OpenAI SSE 模板 */
-	tpl := `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null}]}`
-	tpl, _ = sjson.Set(tpl, "id", state.ResponseID)
-	tpl, _ = sjson.Set(tpl, "created", state.CreatedAt)
-	tpl, _ = sjson.Set(tpl, "model", state.Model)
-
-	/* 设置 usage（如果存在） */
-	if usage := root.Get("response.usage"); usage.Exists() {
-		if v := usage.Get("output_tokens"); v.Exists() {
-			tpl, _ = sjson.Set(tpl, "usage.completion_tokens", v.Int())
-		}
-		if v := usage.Get("total_tokens"); v.Exists() {
-			tpl, _ = sjson.Set(tpl, "usage.total_tokens", v.Int())
-		}
-		if v := usage.Get("input_tokens"); v.Exists() {
-			tpl, _ = sjson.Set(tpl, "usage.prompt_tokens", v.Int())
-		}
-		/* 透传 cached_tokens 和 reasoning_tokens 细分信息（issue #391） */
-		if v := usage.Get("input_tokens_details.cached_tokens"); v.Exists() {
-			tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cached_tokens", v.Int())
-		}
-		if v := usage.Get("output_tokens_details.reasoning_tokens"); v.Exists() {
-			tpl, _ = sjson.Set(tpl, "usage.completion_tokens_details.reasoning_tokens", v.Int())
-		}
+	/*
+	 * 复用预构建的基础模板（id/created/model 已设置好）
+	 * Go 字符串不可变，sjson.Set 返回新字符串，不会污染 baseTpl
+	 * 每个 delta 事件省去 3 次 sjson.Set
+	 */
+	tpl := state.baseTpl
+	if tpl == "" {
+		tpl = `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null}]}`
+		tpl, _ = sjson.Set(tpl, "id", state.ResponseID)
+		tpl, _ = sjson.Set(tpl, "created", state.CreatedAt)
+		tpl, _ = sjson.Set(tpl, "model", state.Model)
 	}
 
 	switch dataType {
@@ -135,6 +133,28 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 			finishReason = "tool_calls"
 		}
 		tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", finishReason)
+
+		/* usage 只在 response.completed 事件中存在，提取并存入 state */
+		if usage := root.Get("response.usage"); usage.Exists() {
+			state.UsageInput = usage.Get("input_tokens").Int()
+			state.UsageOutput = usage.Get("output_tokens").Int()
+			state.UsageTotal = usage.Get("total_tokens").Int()
+			if v := usage.Get("output_tokens"); v.Exists() {
+				tpl, _ = sjson.Set(tpl, "usage.completion_tokens", v.Int())
+			}
+			if v := usage.Get("total_tokens"); v.Exists() {
+				tpl, _ = sjson.Set(tpl, "usage.total_tokens", v.Int())
+			}
+			if v := usage.Get("input_tokens"); v.Exists() {
+				tpl, _ = sjson.Set(tpl, "usage.prompt_tokens", v.Int())
+			}
+			if v := usage.Get("input_tokens_details.cached_tokens"); v.Exists() {
+				tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cached_tokens", v.Int())
+			}
+			if v := usage.Get("output_tokens_details.reasoning_tokens"); v.Exists() {
+				tpl, _ = sjson.Set(tpl, "usage.completion_tokens_details.reasoning_tokens", v.Int())
+			}
+		}
 
 	case "response.output_item.added":
 		item := root.Get("item")

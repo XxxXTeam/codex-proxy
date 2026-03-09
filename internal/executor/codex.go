@@ -255,10 +255,9 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		extractUsageFromStreamLine(line, account)
+		/* 不再调用 extractUsageFromStreamLine，ConvertStreamChunk 内部已提取 usage 到 state */
 		chunks := translator.ConvertStreamChunk(ctx, line, state, reverseToolMap)
 		for _, chunk := range chunks {
-			/* 直接写入，零分配，流式高频路径不做内存分配 */
 			_, _ = writer.Write(sseDataPrefix)
 			_, _ = io.WriteString(writer, chunk)
 			_, _ = writer.Write(sseDataSuffix)
@@ -278,6 +277,10 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 		flusher.Flush()
 	}
 
+	/* 从 state 中读取 usage（ConvertStreamChunk 在 response.completed 时已提取） */
+	if state.UsageInput > 0 || state.UsageOutput > 0 {
+		account.RecordUsage(state.UsageInput, state.UsageOutput, state.UsageTotal)
+	}
 	account.RecordSuccess()
 	return nil
 }
@@ -312,14 +315,21 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		extractUsageFromStreamLine(line, account)
-
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
 		jsonData := bytes.TrimSpace(line[5:])
 		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
 			continue
+		}
+		/* 提取 usage 并记录 */
+		usage := gjson.GetBytes(jsonData, "response.usage")
+		if usage.Exists() {
+			account.RecordUsage(
+				usage.Get("input_tokens").Int(),
+				usage.Get("output_tokens").Int(),
+				usage.Get("total_tokens").Int(),
+			)
 		}
 		result := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
 		if result != "" {
@@ -416,14 +426,21 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		extractUsageFromStreamLine(line, account)
-
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
 		jsonData := bytes.TrimSpace(line[5:])
 		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
 			continue
+		}
+		/* 提取 usage 并记录 */
+		usage := gjson.GetBytes(jsonData, "response.usage")
+		if usage.Exists() {
+			account.RecordUsage(
+				usage.Get("input_tokens").Int(),
+				usage.Get("output_tokens").Int(),
+				usage.Get("total_tokens").Int(),
+			)
 		}
 		if resp := gjson.GetBytes(jsonData, "response"); resp.Exists() {
 			account.RecordSuccess()
@@ -640,16 +657,17 @@ func handleAccountError(account *auth.Account, statusCode int, body []byte) {
 
 	switch {
 	case statusCode == 429:
-		/* 配额耗尽，设置配额冷却 */
 		cooldown := parseRetryAfter(body)
 		if cooldown > 0 {
 			account.SetQuotaCooldown(cooldown)
 		}
+		log.Debugf("账号 [%s] 请求 429，冷却 %v", account.GetEmail(), cooldown)
 	case statusCode == 403:
 		account.SetCooldown(5 * time.Minute)
+		log.Debugf("账号 [%s] 请求 403，冷却 5m", account.GetEmail())
+	default:
+		log.Warnf("账号 [%s] 请求失败 [%d]: %s", account.GetEmail(), statusCode, summarizeError(body))
 	}
-
-	log.Warnf("账号 [%s] 请求失败 [%d]: %s", account.GetEmail(), statusCode, summarizeError(body))
 }
 
 /**
@@ -678,8 +696,8 @@ func summarizeError(body []byte) string {
 	if msg := gjson.GetBytes(body, "error.message").String(); msg != "" {
 		return msg
 	}
-	if len(body) > 200 {
-		return string(body[:200]) + "..."
+	if len(body) > 100 {
+		return string(body[:100]) + "..."
 	}
 	return string(body)
 }
@@ -709,29 +727,6 @@ func parseRetryAfter(body []byte) time.Duration {
 
 	/* 默认冷却 60 秒 */
 	return 60 * time.Second
-}
-
-/**
- * extractUsageFromStreamLine 从单行 SSE 数据中提取 usage（用于流式场景）
- * @param line - 单行 SSE 数据
- * @param account - 要记录 usage 的账号
- */
-func extractUsageFromStreamLine(line []byte, account *auth.Account) {
-	if !bytes.HasPrefix(line, []byte("data:")) {
-		return
-	}
-	jsonData := bytes.TrimSpace(line[5:])
-	if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
-		return
-	}
-	usage := gjson.GetBytes(jsonData, "response.usage")
-	if !usage.Exists() {
-		return
-	}
-	inputTokens := usage.Get("input_tokens").Int()
-	outputTokens := usage.Get("output_tokens").Int()
-	totalTokens := usage.Get("total_tokens").Int()
-	account.RecordUsage(inputTokens, outputTokens, totalTokens)
 }
 
 /**

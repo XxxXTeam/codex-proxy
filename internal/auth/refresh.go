@@ -27,6 +27,36 @@ const (
 )
 
 /**
+ * RefreshError Token 刷新的结构化错误
+ * 包含 HTTP 状态码，让调用方能区分 429（限频）和其他错误
+ * @field StatusCode - HTTP 状态码（0 表示非 HTTP 错误，如网络错误）
+ * @field Msg - 精简的错误摘要
+ */
+type RefreshError struct {
+	StatusCode int
+	Msg        string
+}
+
+func (e *RefreshError) Error() string {
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("刷新失败 [%d]: %s", e.StatusCode, e.Msg)
+	}
+	return e.Msg
+}
+
+/**
+ * IsRateLimitRefreshErr 判断刷新错误是否是 429 限频
+ * @param err - 错误对象
+ * @returns bool - 是 429 限频返回 true
+ */
+func IsRateLimitRefreshErr(err error) bool {
+	if re, ok := err.(*RefreshError); ok {
+		return re.StatusCode == 429
+	}
+	return false
+}
+
+/**
  * Refresher 负责 Codex Token 的刷新操作
  * @field httpClient - 用于发送刷新请求的 HTTP 客户端
  */
@@ -117,13 +147,18 @@ func (r *Refresher) RefreshToken(ctx context.Context, refreshToken string) (*Tok
 		_ = resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, fmt.Errorf("读取刷新响应失败: %w", err)
+		return nil, &RefreshError{Msg: "读取刷新响应失败"}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("刷新失败，状态码 %d: %s", resp.StatusCode, string(body))
+		/* 截断响应体，避免日志刷屏 */
+		msg := string(body)
+		if len(msg) > 150 {
+			msg = msg[:150] + "..."
+		}
+		return nil, &RefreshError{StatusCode: resp.StatusCode, Msg: msg}
 	}
 
 	var tokenResp tokenResponse
@@ -171,17 +206,17 @@ func (r *Refresher) RefreshTokenWithRetry(ctx context.Context, refreshToken stri
 			return tokenData, nil
 		}
 
-		/* refresh_token_reused 错误不可重试 */
-		if isNonRetryableErr(err) {
-			log.Warnf("Token 刷新失败（不可重试）: %v", err)
+		/* refresh_token_reused / 429 等不可重试错误立即返回 */
+		if isNonRetryableErr(err) || IsRateLimitRefreshErr(err) {
 			return nil, err
 		}
 
 		lastErr = err
-		log.Warnf("Token 刷新第 %d 次尝试失败: %v", attempt+1, err)
+		/* 重试日志用 Debug 级别，避免大量账号刷新时刷屏 */
+		log.Debugf("Token 刷新第 %d/%d 次失败: %v", attempt+1, maxRetries, err)
 	}
 
-	return nil, fmt.Errorf("Token 刷新在 %d 次尝试后失败: %w", maxRetries, lastErr)
+	return nil, lastErr
 }
 
 /**
