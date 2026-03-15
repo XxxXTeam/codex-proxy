@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -64,18 +65,25 @@ func NewExecutor(baseURL, proxyURL string) *Executor {
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 60 * time.Second,
+	}
 
 	transport := &http.Transport{
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   50,
-		MaxConnsPerHost:       100,
-		IdleConnTimeout:       300 * time.Second,
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   512,
+		MaxConnsPerHost:       512, /* 上限避免无限建连导致端口耗尽和队列拥堵 */
+		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 		WriteBufferSize:       32 * 1024,
 		ReadBufferSize:        32 * 1024,
-		ForceAttemptHTTP2:     true,
-		DisableCompression:    true, /* SSE 流不需要 gzip 解压开销 */
+		ForceAttemptHTTP2:     false,                                                  /* 禁用 HTTP/2，避免同一连接上的流量拥塞影响长 SSE */
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, /* 彻底禁用 HTTP/2 */
+		DisableCompression:    true,                                                   /* SSE 流不需要 gzip 解压开销 */
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
 	}
 
@@ -144,7 +152,7 @@ func IsRetryableStatus(code int) bool {
  * @returns *auth.Account - 使用的账号
  * @returns error - 所有重试均失败时返回错误
  */
-func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model string, apiURL string, codexBody []byte, stream bool) (*http.Response, *auth.Account, error) {
+func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model string, apiURL string, codexBody []byte, stream bool) (*http.Response, *auth.Account, int, error) {
 	excluded := make(map[string]bool)
 	maxAttempts := rc.MaxRetry + 1
 	var lastErr error
@@ -157,17 +165,17 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		account, err := rc.PickFn(model, excluded)
 		if err != nil {
 			if attempt == 0 {
-				return nil, nil, err
+				return nil, nil, attempt + 1, err
 			}
 			break
 		}
 		excluded[account.FilePath] = true
-
-		log.Debugf("使用账号: %s (尝试 %d/%d)", account.GetEmail(), attempt+1, maxAttempts)
+		startAttempt := time.Now()
+		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attempt+1, maxAttempts, account.GetEmail(), model, stream)
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
 		if err != nil {
-			return nil, nil, fmt.Errorf("创建请求失败: %w", err)
+			return nil, nil, attempt + 1, fmt.Errorf("创建请求失败: %w", err)
 		}
 		applyCodexHeaders(httpReq, account, stream)
 
@@ -176,7 +184,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			account.RecordFailure()
 			lastErr = fmt.Errorf("请求发送失败: %w", err)
 			if attempt < maxAttempts-1 {
-				log.Warnf("账号 [%s] 网络错误，切换账号重试: %v", account.GetEmail(), err)
+				log.Warnf("账号 [%s] 网络错误，切换账号重试: %v (elapsed=%v)", account.GetEmail(), err, time.Since(startAttempt).Round(time.Millisecond))
 				continue
 			}
 			break
@@ -184,7 +192,8 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 
 		/* 2xx 成功 */
 		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
-			return httpResp, account, nil
+			log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
+			return httpResp, account, attempt + 1, nil
 		}
 
 		/* 错误状态码：读取错误体、处理账号状态、判断是否可重试 */
@@ -201,19 +210,20 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		lastErr = statusErr
 
 		if !IsRetryableStatus(httpResp.StatusCode) {
-			return nil, nil, statusErr
+			log.Debugf("send attempt non-retryable status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
+			return nil, nil, attempt + 1, statusErr
 		}
 
 		if attempt < maxAttempts-1 {
-			log.Warnf("账号 [%s] [%d] 切换重试", account.GetEmail(), httpResp.StatusCode)
+			log.Warnf("账号 [%s] [%d] 切换重试 (elapsed=%v)", account.GetEmail(), httpResp.StatusCode, time.Since(startAttempt).Round(time.Millisecond))
 			continue
 		}
 	}
 
 	if lastErr != nil {
-		return nil, nil, lastErr
+		return nil, nil, maxAttempts, lastErr
 	}
-	return nil, nil, fmt.Errorf("请求失败")
+	return nil, nil, maxAttempts, fmt.Errorf("请求失败")
 }
 
 /**
@@ -229,14 +239,19 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
+	startTotal := time.Now()
+	convertStart := time.Now()
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 
-	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
 		return err
 	}
+	sendDur := time.Since(sendStart)
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
@@ -269,6 +284,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 
 	if err = scanner.Err(); err != nil {
 		log.Errorf("读取流式响应失败: %v", err)
+		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 		return err
 	}
 
@@ -282,6 +298,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 		account.RecordUsage(state.UsageInput, state.UsageOutput, state.UsageTotal)
 	}
 	account.RecordSuccess()
+	log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return nil
 }
 
@@ -297,14 +314,18 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
+	startTotal := time.Now()
+	convertStart := time.Now()
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
-
-	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
 		return nil, err
 	}
+	sendDur := time.Since(sendStart)
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
@@ -334,14 +355,17 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 		result := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
 		if result != "" {
 			account.RecordSuccess()
+			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 			return []byte(result), nil
 		}
 	}
 
 	if err = scanner.Err(); err != nil {
+		log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 
+	log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (no completed)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return nil, fmt.Errorf("未收到 response.completed 事件")
 }
 
@@ -357,14 +381,19 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
+	startTotal := time.Now()
+	convertStart := time.Now()
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 
-	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
 		return err
 	}
+	sendDur := time.Since(sendStart)
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
@@ -387,13 +416,14 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, r
 		if readErr != nil {
 			if readErr != io.EOF {
 				log.Errorf("读取流式响应失败: %v", readErr)
+				log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 				return readErr
 			}
 			break
 		}
 	}
-
 	account.RecordSuccess()
+	log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return nil
 }
 
@@ -409,14 +439,19 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, r
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
+	startTotal := time.Now()
+	convertStart := time.Now()
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 
-	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
 		return nil, err
 	}
+	sendDur := time.Since(sendStart)
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
@@ -444,14 +479,17 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 		}
 		if resp := gjson.GetBytes(jsonData, "response"); resp.Exists() {
 			account.RecordSuccess()
+			log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 			return []byte(resp.Raw), nil
 		}
 	}
 
 	if err = scanner.Err(); err != nil {
+		log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 
+	log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (no completed)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return nil, fmt.Errorf("未收到 response.completed 事件")
 }
 
@@ -467,14 +505,19 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
+	startTotal := time.Now()
+	convertStart := time.Now()
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 	codexBody := cleanCompactBody(body, baseModel)
+	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses/compact"
 
-	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
 		return err
 	}
+	sendDur := time.Since(sendStart)
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
@@ -503,6 +546,7 @@ func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryCo
 	}
 
 	account.RecordSuccess()
+	log.Infof("req summary responses-compact-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return nil
 }
 
@@ -518,11 +562,15 @@ func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryCo
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
+	startTotal := time.Now()
+	convertStart := time.Now()
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 	codexBody := cleanCompactBody(body, baseModel)
+	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses/compact"
 
-	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, false)
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, false)
 	if err != nil {
 		return nil, err
 	}
@@ -532,10 +580,12 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
+		log.Infof("req summary responses-compact-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 
 	account.RecordSuccess()
+	log.Infof("req summary responses-compact-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return data, nil
 }
 
