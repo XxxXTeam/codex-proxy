@@ -1,0 +1,694 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>数据统计与展示</title>
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --ink: #141313;
+      --muted: #6b625a;
+      --accent: #ff6b35;
+      --accent-2: #1b9aaa;
+      --card: #fff7e6;
+      --card-2: #fef1d1;
+      --line: #e3d6bf;
+      --shadow: 0 10px 30px rgba(0,0,0,.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #ffe6b3, transparent 60%),
+        radial-gradient(1000px 600px at 100% 0%, #c8fff4, transparent 55%),
+        var(--bg);
+      font-family: "Space Grotesk", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .page {
+      max-width: 1200px;
+      margin: 36px auto 80px;
+      padding: 0 20px;
+    }
+    header {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      margin-bottom: 24px;
+    }
+    .title {
+      font-size: 32px;
+      letter-spacing: 0.5px;
+      margin: 0;
+    }
+    .subtitle {
+      color: var(--muted);
+      margin: 6px 0 0;
+      font-size: 14px;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 18px;
+      font-weight: 700;
+      font-size: 14px;
+      cursor: pointer;
+      color: var(--ink);
+      background: linear-gradient(135deg, #ffd166, #ff9f1c);
+      box-shadow: var(--shadow);
+    }
+    button.secondary {
+      background: linear-gradient(135deg, #b3f2ee, #58c8c4);
+    }
+    button.ghost {
+      background: #fff;
+      border: 1px solid var(--line);
+      box-shadow: none;
+    }
+    .pill {
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #fff;
+      border: 1px solid var(--line);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+    .card:nth-child(2) { background: var(--card-2); }
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .card .value {
+      font-size: 28px;
+      font-weight: 700;
+    }
+    .table-wrap {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+    .table-toolbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fffdf7;
+      flex-wrap: wrap;
+    }
+    .toolbar-left, .toolbar-right {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    select, input[type="text"] {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 14px;
+      background: #fff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 10px 14px;
+      border-bottom: 1px solid #f0e7d7;
+      text-align: left;
+      white-space: nowrap;
+    }
+    th {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      background: #fffdf7;
+    }
+    tr:hover td { background: #fff6df; }
+    .status {
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-block;
+    }
+    .status.active { background: #dcfce7; color: #166534; }
+    .status.cooldown { background: #ffe4e6; color: #9f1239; }
+    .status.disabled { background: #e2e8f0; color: #475569; }
+    .muted { color: var(--muted); }
+    .pagination {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .pagination button {
+      padding: 6px 12px;
+      font-size: 12px;
+    }
+    .footer {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .placeholder {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: var(--shadow);
+      display: grid;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .placeholder-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    .skeleton {
+      height: 16px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #f3ead7 25%, #fff7e6 50%, #f3ead7 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.6s infinite;
+    }
+    .skeleton.big { height: 28px; border-radius: 12px; }
+    .loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(255, 247, 230, 0.7);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 20;
+    }
+    .login-overlay {
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #ffe6b3, transparent 60%),
+        radial-gradient(1000px 600px at 100% 0%, #c8fff4, transparent 55%),
+        var(--bg);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 30;
+      padding: 20px;
+    }
+    .login-overlay.active { display: flex; }
+    .login-card {
+      width: min(520px, 100%);
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 24px;
+      box-shadow: var(--shadow);
+      display: grid;
+      gap: 16px;
+    }
+    .login-card h2 {
+      margin: 0;
+      font-size: 22px;
+    }
+    .login-card label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .login-card input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 14px;
+      background: #fff;
+    }
+    .login-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    .loading-overlay.active { display: flex; }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      border: 5px solid #ffd8a8;
+      border-top-color: #ff6b35;
+      animation: spin 0.9s linear infinite;
+      box-shadow: var(--shadow);
+    }
+    @keyframes shimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    @media (max-width: 980px) {
+      .grid { grid-template-columns: repeat(2, 1fr); }
+      header { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      .grid { grid-template-columns: 1fr; }
+      th:nth-child(2), td:nth-child(2),
+      th:nth-child(7), td:nth-child(7) { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div>
+        <h1 class="title">数据统计与展示</h1>
+        <p class="subtitle">数据只在点击刷新时更新</p>
+      </div>
+      <div class="actions">
+        <button id="refreshBtn">刷新数据</button>
+        <button id="clearBtn" class="secondary">清空缓存</button>
+        <button id="settingsBtn" class="ghost">设置接口</button>
+        <span class="pill" id="cacheState">缓存：未加载</span>
+      </div>
+    </header>
+
+    <section class="grid" id="summaryCards"></section>
+    <section id="placeholder" class="placeholder" aria-hidden="true">
+      <div class="placeholder-row">
+        <div class="skeleton big"></div>
+        <div class="skeleton big"></div>
+        <div class="skeleton big"></div>
+        <div class="skeleton big"></div>
+      </div>
+      <div class="placeholder-row">
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+      </div>
+      <div class="placeholder-row">
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+      </div>
+    </section>
+
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <div class="toolbar-left">
+          <label class="muted">每页</label>
+          <select id="pageSize">
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+          <span class="muted" id="rowsInfo">0 条记录</span>
+        </div>
+        <div class="toolbar-right">
+          <input id="searchInput" type="text" placeholder="邮箱搜索" />
+          <div class="pagination">
+            <button id="prevBtn">上一页</button>
+            <span id="pageInfo" class="muted">1 / 1</span>
+            <button id="nextBtn">下一页</button>
+          </div>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>邮箱</th>
+            <th>状态</th>
+            <th>套餐</th>
+            <th>请求数</th>
+            <th>错误</th>
+            <th>最后使用</th>
+            <th>Token 过期</th>
+            <th>额度</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+
+    <div class="footer">
+      <span id="updatedAt">上次更新：--</span>
+      <span id="cacheNote" class="muted"></span>
+    </div>
+
+    <div class="loading-overlay" id="loadingOverlay" aria-live="polite" aria-busy="true">
+      <div class="spinner" aria-label="加载中"></div>
+    </div>
+    <div class="login-overlay" id="loginOverlay" aria-live="polite" aria-busy="true">
+      <div class="login-card">
+        <h2>连接数据接口</h2>
+        <div>
+          <label for="apiInput">API 地址</label>
+          <input id="apiInput" type="text" placeholder="http://127.0.0.1/stats" />
+        </div>
+        <div>
+          <label for="tokenInput">Bearer Token</label>
+          <input id="tokenInput" type="text" placeholder="输入访问 Token" />
+        </div>
+        <div class="login-actions">
+          <button id="saveCredentialsBtn">保存并加载</button>
+          <button id="cancelCredentialsBtn" class="ghost">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const CACHE_KEY = "stats_cache_v1";
+    const CRED_KEY = "stats_credentials_v1";
+
+    const els = {
+      summaryCards: document.getElementById("summaryCards"),
+      tableBody: document.getElementById("tableBody"),
+      pageSize: document.getElementById("pageSize"),
+      pageInfo: document.getElementById("pageInfo"),
+      rowsInfo: document.getElementById("rowsInfo"),
+      prevBtn: document.getElementById("prevBtn"),
+      nextBtn: document.getElementById("nextBtn"),
+      refreshBtn: document.getElementById("refreshBtn"),
+      clearBtn: document.getElementById("clearBtn"),
+      updatedAt: document.getElementById("updatedAt"),
+      cacheState: document.getElementById("cacheState"),
+      cacheNote: document.getElementById("cacheNote"),
+      searchInput: document.getElementById("searchInput"),
+      placeholder: document.getElementById("placeholder"),
+      loadingOverlay: document.getElementById("loadingOverlay"),
+      loginOverlay: document.getElementById("loginOverlay"),
+      apiInput: document.getElementById("apiInput"),
+      tokenInput: document.getElementById("tokenInput"),
+      saveCredentialsBtn: document.getElementById("saveCredentialsBtn"),
+      cancelCredentialsBtn: document.getElementById("cancelCredentialsBtn"),
+      settingsBtn: document.getElementById("settingsBtn")
+    };
+
+    let cache = null;
+    let filteredAccounts = [];
+    let currentPage = 1;
+    let pageSize = Number(els.pageSize.value);
+    let memoryOnlyCache = false;
+    let credentials = null;
+
+    function formatNumber(n) {
+      return new Intl.NumberFormat("zh-CN").format(n ?? 0);
+    }
+
+    function formatDate(value) {
+      if (!value || value.startsWith("0001")) return "--";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return "--";
+      return d.toLocaleString("zh-CN");
+    }
+
+    function setCache(data, meta) {
+      cache = { data, meta };
+      memoryOnlyCache = false;
+      try {
+        localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+      } catch (err) {
+        memoryOnlyCache = true;
+      }
+      updateCacheBadge();
+    }
+
+    function getCache() {
+      if (cache) return cache;
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return null;
+      try {
+        cache = JSON.parse(raw);
+        return cache;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function clearCache() {
+      cache = null;
+      memoryOnlyCache = false;
+      localStorage.removeItem(CACHE_KEY);
+      updateCacheBadge();
+    }
+
+    function updateCacheBadge() {
+      if (!cache) {
+        els.cacheState.textContent = "缓存：未加载";
+        els.cacheNote.textContent = "";
+        return;
+      }
+      const cachedAt = cache.meta?.cachedAt || "--";
+      els.cacheState.textContent = memoryOnlyCache ? "缓存：内存" : "缓存：本地";
+      els.cacheNote.textContent = "";
+      els.updatedAt.textContent = `上次更新：${cachedAt}`;
+    }
+    
+    function getCredentials() {
+      if (credentials) return credentials;
+      const raw = localStorage.getItem(CRED_KEY);
+      if (!raw) return null;
+      try {
+        credentials = JSON.parse(raw);
+        return credentials;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function saveCredentials(apiUrl, token) {
+      credentials = { apiUrl, token };
+      localStorage.setItem(CRED_KEY, JSON.stringify(credentials));
+    }
+
+    function getDefaultApiUrl() {
+      const origin = window.location.origin || "";
+      if (origin && origin !== "null") return `${origin}/stats`;
+      return "http://127.0.0.1/stats";
+    }
+
+    function showLogin(show) {
+      els.loginOverlay.classList.toggle("active", show);
+      if (show) {
+        const existing = getCredentials();
+        const fallbackUrl = getDefaultApiUrl();
+        els.apiInput.value = existing?.apiUrl || fallbackUrl;
+        els.apiInput.placeholder = fallbackUrl;
+        els.tokenInput.value = existing?.token || "";
+      }
+    }
+
+    function renderSummary(summary, accounts) {
+      const safe = summary || {};
+      const total = safe.total ?? accounts.length;
+      const cards = [
+        { label: "总账号", value: total, color: "#ff6b35" },
+        { label: "活跃", value: safe.active ?? 0, color: "#16a34a" },
+        { label: "冷却中", value: safe.cooldown ?? 0, color: "#db2777" },
+        { label: "禁用", value: safe.disabled ?? 0, color: "#475569" }
+      ];
+      els.summaryCards.innerHTML = cards.map(card => `
+        <div class="card">
+          <h3>${card.label}</h3>
+          <div class="value">${formatNumber(card.value)}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderTablePage() {
+      const total = filteredAccounts.length;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      currentPage = Math.min(currentPage, totalPages);
+      const start = (currentPage - 1) * pageSize;
+      const end = Math.min(start + pageSize, total);
+      const pageRows = filteredAccounts.slice(start, end);
+
+      const fragment = document.createDocumentFragment();
+      for (const row of pageRows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${row.email || "--"}</td>
+          <td><span class="status ${row.status || "disabled"}">${row.status || "--"}</span></td>
+          <td>${row.plan_type || "--"}</td>
+          <td>${formatNumber(row.total_requests)}</td>
+          <td>${formatNumber(row.total_errors)}</td>
+          <td>${formatDate(row.last_used_at)}</td>
+          <td>${formatDate(row.token_expire)}</td>
+          <td>${row.quota_exhausted ? "已用尽" : "可用"}</td>
+        `;
+        fragment.appendChild(tr);
+      }
+      els.tableBody.innerHTML = "";
+      els.tableBody.appendChild(fragment);
+
+      els.pageInfo.textContent = `${currentPage} / ${totalPages}`;
+      els.rowsInfo.textContent = `${formatNumber(total)} 条记录，当前显示 ${formatNumber(start + 1)}-${formatNumber(end)}`;
+      els.prevBtn.disabled = currentPage === 1;
+      els.nextBtn.disabled = currentPage === totalPages;
+    }
+
+    function applyFilter() {
+      const kw = els.searchInput.value.trim().toLowerCase();
+      const accounts = cache?.data?.accounts || [];
+      if (!kw) {
+        filteredAccounts = accounts;
+      } else {
+        filteredAccounts = accounts.filter(a => (a.email || "").toLowerCase().includes(kw));
+      }
+      currentPage = 1;
+      renderTablePage();
+    }
+
+    function setLoading(isLoading) {
+      if (isLoading) {
+        els.loadingOverlay.classList.add("active");
+      } else {
+        els.loadingOverlay.classList.remove("active");
+      }
+    }
+
+    function showPlaceholder(show) {
+      els.placeholder.style.display = show ? "grid" : "none";
+      if (show) {
+        els.summaryCards.innerHTML = "";
+        els.tableBody.innerHTML = "";
+        els.rowsInfo.textContent = "0 条记录";
+        els.pageInfo.textContent = "1 / 1";
+        els.prevBtn.disabled = true;
+        els.nextBtn.disabled = true;
+      }
+    }
+
+    async function fetchStats() {
+      els.cacheState.textContent = "缓存：加载中...";
+      setLoading(true);
+      try {
+        const cred = getCredentials();
+        if (!cred?.apiUrl) {
+          showLogin(true);
+          return;
+        }
+        const headers = {};
+        if (cred.token) headers.Authorization = `Bearer ${cred.token}`;
+        const res = await fetch(cred.apiUrl, { method: "GET", headers });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const cachedAt = new Date().toLocaleString("zh-CN");
+        setCache(data, { cachedAt });
+        render(data);
+      } catch (err) {
+        if (!cache) showPlaceholder(true);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    function render(data) {
+      renderSummary(data.summary, data.accounts || []);
+      filteredAccounts = data.accounts || [];
+      applyFilter();
+      showPlaceholder(false);
+      updateCacheBadge();
+    }
+
+    function init() {
+      const existing = getCache();
+      if (existing?.data) {
+        render(existing.data);
+        showPlaceholder(false);
+      } else {
+        showPlaceholder(true);
+        fetchStats();
+      }
+      updateCacheBadge();
+    }
+
+    els.pageSize.addEventListener("change", () => {
+      pageSize = Number(els.pageSize.value);
+      currentPage = 1;
+      renderTablePage();
+    });
+    els.prevBtn.addEventListener("click", () => {
+      currentPage = Math.max(1, currentPage - 1);
+      renderTablePage();
+    });
+    els.nextBtn.addEventListener("click", () => {
+      currentPage += 1;
+      renderTablePage();
+    });
+    els.refreshBtn.addEventListener("click", () => {
+      clearCache();
+      showPlaceholder(true);
+      fetchStats();
+    });
+    els.clearBtn.addEventListener("click", () => {
+      clearCache();
+      showPlaceholder(true);
+    });
+    els.settingsBtn.addEventListener("click", () => {
+      showLogin(true);
+    });
+    els.saveCredentialsBtn.addEventListener("click", () => {
+      const apiUrl = els.apiInput.value.trim();
+      const token = els.tokenInput.value.trim();
+      if (!apiUrl) return;
+      saveCredentials(apiUrl, token);
+      showLogin(false);
+      clearCache();
+      showPlaceholder(true);
+      fetchStats();
+    });
+    els.cancelCredentialsBtn.addEventListener("click", () => {
+      showLogin(false);
+    });
+    els.searchInput.addEventListener("input", () => {
+      applyFilter();
+    });
+
+    init();
+  </script>
+</body>
+</html>

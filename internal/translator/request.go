@@ -103,6 +103,7 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 
 		/* 删除上游不支持的参数 */
 		result, _ = sjson.DeleteBytes(result, "previous_response_id")
+		result, _ = sjson.DeleteBytes(result, "stream_options")
 		result, _ = sjson.DeleteBytes(result, "prompt_cache_retention")
 		result, _ = sjson.DeleteBytes(result, "safety_identifier")
 		result, _ = sjson.DeleteBytes(result, "generate")

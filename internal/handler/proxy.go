@@ -33,6 +33,7 @@ type ProxyHandler struct {
 	apiKeys      []string
 	maxRetry     int
 	quotaChecker *auth.QuotaChecker
+	indexHTML    []byte
 }
 
 /**
@@ -43,7 +44,7 @@ type ProxyHandler struct {
  * @param maxRetry - 最大重试次数（0 表示不重试）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, proxyURL string) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, proxyURL string, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -53,6 +54,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		apiKeys:      apiKeys,
 		maxRetry:     maxRetry,
 		quotaChecker: auth.NewQuotaChecker(proxyURL, 50),
+		indexHTML:    indexHTML,
 	}
 }
 
@@ -61,6 +63,9 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
  * @param r - Gin 引擎实例
  */
 func (h *ProxyHandler) RegisterRoutes(r *gin.Engine) {
+	/* 首页 */
+	r.GET("/", h.handleIndex)
+
 	/* 健康检查 */
 	r.GET("/health", h.handleHealth)
 

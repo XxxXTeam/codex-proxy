@@ -140,7 +140,6 @@ const (
  */
 type AccountStats struct {
 	Email               string     `json:"email"`
-	FilePath            string     `json:"file_path"`
 	Status              string     `json:"status"`
 	PlanType            string     `json:"plan_type,omitempty"`
 	DisableReason       string     `json:"disable_reason,omitempty"`
@@ -444,7 +443,6 @@ func (a *Account) GetStats() AccountStats {
 
 	return AccountStats{
 		Email:               a.Token.Email,
-		FilePath:            a.FilePath,
 		Status:              statusStr,
 		PlanType:            a.Token.PlanType,
 		DisableReason:       a.DisableReason,

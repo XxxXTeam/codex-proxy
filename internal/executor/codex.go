@@ -553,6 +553,7 @@ func cleanCompactBody(body []byte, baseModel string) []byte {
 
 	/* 删除 Compact 端点不支持的参数 */
 	result, _ = sjson.DeleteBytes(result, "stream")
+	result, _ = sjson.DeleteBytes(result, "stream_options")
 	result, _ = sjson.DeleteBytes(result, "parallel_tool_calls")
 	result, _ = sjson.DeleteBytes(result, "reasoning")
 	result, _ = sjson.DeleteBytes(result, "include")

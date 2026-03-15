@@ -147,29 +147,32 @@ curl http://localhost:8080/v1/messages \
 
 ```
 codex-proxy/
-├── main.go                          # 服务入口
-├── config.yaml                      # 配置文件
-├── auths/                           # 账号文件目录
-│   └── account1.json
-├── internal/
-│   ├── config/config.go             # 配置加载
-│   ├── auth/
-│   │   ├── types.go                 # Token/账号数据结构
-│   │   ├── refresh.go               # Token 刷新（OAuth + 结构化错误）
-│   │   ├── selector.go              # 多号轮询选择器（额度均衡）
-│   │   ├── manager.go               # 账号管理器（热加载/刷新/异步写盘）
-│   │   ├── health.go                # 健康检查器
-│   │   └── quota.go                 # 额度查询器
-│   ├── thinking/
-│   │   ├── types.go                 # 思考类型定义
-│   │   ├── suffix.go                # 连字符格式解析（逆向剥离）
-│   │   └── apply.go                 # 思考配置应用
-│   ├── translator/
-│   │   ├── request.go               # OpenAI → Codex 请求转换 + Schema 修复
-│   │   ├── response.go              # Codex → OpenAI 响应转换（预构建模板）
-│   │   └── claude.go                # Claude Messages API 协议转换
-│   ├── executor/codex.go            # Codex API 执行器（内部重试 + 连接池保活）
-│   └── handler/
-│       ├── proxy.go                 # HTTP 代理处理器（OpenAI 兼容）
-│       └── claude.go                # Claude Messages 处理器
+  |-- main.go                           # 服务入口
+  |-- embedded_assets.go                # 静态资源嵌入（assets/index.html）
+  |-- assets/
+  |   |-- index.html                    # 统计/展示首页
+  |-- config.yaml                       # 运行配置
+  |-- config.example.yaml               # 示例配置
+  |-- auths/                            # 账号文件目录
+  |   |-- account1.json
+  |-- internal/
+  |   |-- config/config.go              # 配置加载
+  |   |-- auth/
+  |   |   |-- types.go                  # Token/账号数据结构
+  |   |   |-- refresh.go                # Token 刷新（Auth + 结构化错误）
+  |   |   |-- selector.go               # 多号轮询选择器（额度均衡）
+  |   |   |-- manager.go                # 账号管理器（热加载/刷新/异步写盘）
+  |   |   |-- health.go                 # 健康检查器
+  |   |   `-- quota.go                  # 额度查询器
+  |   |-- thinking/
+  |   |   |-- types.go                  # 思考类型定义
+  |   |   |-- suffix.go                 # 连字符格式解析（逆向剪离）
+  |   |   |-- request.go                # OpenAI -> Codex 请求转换 + Schema 修复
+  |   |   |-- response.go               # Codex -> OpenAI 响应转换（预构建模板）
+  |   |   `-- claude.go                 # Claude Messages API 协议转换
+  |   |-- executor/codex.go             # Codex API 执行器（内部重试 + 连接池保活）
+  |       |-- proxy.go                  # HTTP 代理处理器（OpenAI 兼容）
+  |       |-- claude.go                 # Claude Messages 处理器
+  |       |-- index.go                  # 首页处理器（返回 index.html）
+  |       `-- middleware.go             # CORS/预检/Gzip 中间件
 ```

@@ -105,11 +105,14 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
+	r.Use(handler.CORSAllowOrigin())
+	r.Use(handler.GzipIfAccepted())
+	r.Use(handler.OptionsBypass())
 	r.Use(gin.Recovery())
 	r.Use(ginLogger())
 
 	/* 注册路由 */
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.ProxyURL)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.ProxyURL, indexHTML)
 	proxyHandler.RegisterRoutes(r)
 
 	/* 使用 http.Server 以支持优雅关闭 */
