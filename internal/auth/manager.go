@@ -148,16 +148,35 @@ func NewManager(authDir string, db *sql.DB, proxyURL string, refreshInterval int
 	return m
 }
 
-/* refreshRequestContext 用于后台 OAuth/额度等短请求，与 Codex 对话长连接无关 */
-func (m *Manager) refreshRequestContext(parent context.Context) (context.Context, context.CancelFunc) {
+/* refreshRequestContext 用于 OAuth 刷新 HTTP：超时仅基于 Background，不继承调用方 context 的 deadline，避免长对话/批处理把 parent 掐死导致误报 context deadline exceeded */
+func (m *Manager) refreshRequestContext(_ context.Context) (context.Context, context.CancelFunc) {
 	sec := m.refreshSingleTimeoutSec
 	if sec < 1 {
 		sec = defaultRefreshSingleTimeoutSec
 	}
-	if parent == nil {
-		parent = context.Background()
+	return context.WithTimeout(context.Background(), time.Duration(sec)*time.Second)
+}
+
+/* waitAccountRefreshIdle 等待他处（如后台刷新）释放 refreshing 标志，避免 401 时误判 skipped_busy 导致不换 token 就换号/空返回 */
+func (m *Manager) waitAccountRefreshIdle(ctx context.Context, acc *Account) bool {
+	if acc == nil {
+		return false
 	}
-	return context.WithTimeout(parent, time.Duration(sec)*time.Second)
+	if acc.refreshing.Load() == 0 {
+		return true
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			if acc.refreshing.Load() == 0 {
+				return true
+			}
+		}
+	}
 }
 
 /**
@@ -1584,9 +1603,17 @@ func (m *Manager) RecoverAuth401(ctx context.Context, acc *Account, qc *QuotaChe
 	out := Auth401RecoverResult{Email: email, FilePath: fp}
 
 	if !acc.refreshing.CompareAndSwap(0, 1) {
+		/* 与后台批量刷新并发时：等对方写完 Token 后本请求同号重试，避免刷新已成功却仍走换号/空解析 */
+		log.Debugf("账号 [%s] 正在他处刷新 Token，401 恢复等待其完成…", email)
+		if m.waitAccountRefreshIdle(ctx, acc) {
+			out.Status = Auth401RecoverRefreshed
+			out.Detail = "waited_peer_refresh"
+			log.Infof("账号 [%s] 401 恢复：已等待进行中的刷新结束，将用当前凭据重试上游", email)
+			return out
+		}
 		out.Status = Auth401RecoverSkippedBusy
-		out.Detail = "账号正在刷新中，跳过"
-		log.Debugf("账号 [%s] 已在刷新中，跳过 401 恢复", email)
+		out.Detail = "账号正在刷新中，等待超时"
+		log.Warnf("账号 [%s] 401 恢复：等待他处刷新超时，跳过同号重试", email)
 		return out
 	}
 	defer acc.refreshing.Store(0)
@@ -1637,9 +1664,9 @@ func (m *Manager) RecoverAuth401(ctx context.Context, acc *Account, qc *QuotaChe
  * @param acc - 返回 401 的账号
  * @param qc - 额度查询器，可为 nil（此时刷新 429 视为无法复核，直接禁用）
  */
-func (m *Manager) HandleAuth401(acc *Account, qc *QuotaChecker) {
+func (m *Manager) HandleAuth401(acc *Account, qc *QuotaChecker) Auth401RecoverResult {
 	if acc == nil {
-		return
+		return Auth401RecoverResult{Status: Auth401RecoverInvalid, Detail: "account is nil"}
 	}
 	timeoutSec := m.refreshSingleTimeoutSec
 	if timeoutSec < 1 {
@@ -1647,7 +1674,7 @@ func (m *Manager) HandleAuth401(acc *Account, qc *QuotaChecker) {
 	}
 	hctx, hcancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+35)*time.Second)
 	defer hcancel()
-	_ = m.RecoverAuth401(hctx, acc, qc)
+	return m.RecoverAuth401(hctx, acc, qc)
 }
 
 /**

@@ -279,7 +279,10 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 		PickFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
 			return h.manager.PickExcluding(model, excluded)
 		},
-		On401Fn: func(acc *auth.Account) { h.manager.HandleAuth401(acc, h.quotaChecker) },
+		On401Fn: func(acc *auth.Account) bool {
+			r := h.manager.HandleAuth401(acc, h.quotaChecker)
+			return r.Status == auth.Auth401RecoverRefreshed || r.Status == auth.Auth401RecoverCooldown429OK
+		},
 		On429RecoveryFn: func(ctx context.Context, acc *auth.Account) {
 			h.manager.ScheduleUpstream429Recovery(ctx, acc, h.quotaChecker)
 		},
@@ -297,10 +300,9 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 		if h.maxRetry >= 2 {
 			/* 前 max-retry-1 次用常规换号，之后用最近成功账号，减少无效轮询 */
 			rc.HealthyPickMinAttempt = h.maxRetry - 1
-		} else {
-			/* max-retry 为 0/1 时无「切换窗口」，仅在全部常规尝试失败后回退一次 */
-			rc.FallbackRecentPickFn = healthyPick
 		}
+		/* 常规尝试用尽后，sendWithRetry 末尾再保底一次「最近成功账号」（可重试已排除的号，见 PickRecentlySuccessful） */
+		rc.FallbackRecentPickFn = healthyPick
 	}
 	return rc
 }

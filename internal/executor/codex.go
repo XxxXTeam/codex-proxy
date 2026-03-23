@@ -174,7 +174,8 @@ type RetryConfig struct {
 	HealthyPickFn         func(model string, excluded map[string]bool) (*auth.Account, error)
 	HealthyPickMinAttempt int /* 从第几次尝试起（0-based）改用 HealthyPickFn；0 表示主循环中不用；通常为 max-retry-1 */
 	FallbackRecentPickFn  func(model string, excluded map[string]bool) (*auth.Account, error)
-	On401Fn               func(acc *auth.Account)
+	/* On401Fn 返回 true 表示已换发新 access_token（或 429 后额度已恢复），调用方应对同一账号立即重发上游请求 */
+	On401Fn               func(acc *auth.Account) bool
 	On429RecoveryFn       func(ctx context.Context, acc *auth.Account)
 	OnAfterUpstreamErrFn  func(acc *auth.Account, statusCode int)
 	MaxRetry              int
@@ -280,52 +281,66 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		startAttempt := time.Now()
 		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attemptOneBased, maxLabel, account.GetEmail(), model, stream)
 
-		buildStart := time.Now()
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", errCodexBuildRequest, err)
-		}
-		applyCodexHeaders(httpReq, account, stream)
-		buildDur := time.Since(buildStart)
-		dialTarget := effectiveDialTarget(httpReq.URL, e.resolveAddr)
-		log.Debugf("upstream request model=%s stream=%v account=%s attempt=%d/%d method=%s url=%s dial_target=%s", model, stream, account.GetEmail(), attemptOneBased, maxLabel, httpReq.Method, httpReq.URL.String(), dialTarget)
+		const maxSameAccount401Rounds = 3
+		var lastStatus *StatusError
+		for round := 0; round < maxSameAccount401Rounds; round++ {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 
-		doStart := time.Now()
-		httpResp, err := e.httpClient.Do(httpReq)
-		doDur := time.Since(doStart)
-		if err != nil {
-			account.RecordFailure()
-			netErr := fmt.Errorf("请求发送失败: %w", err)
-			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=ERR err=%v", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), err)
-			return nil, netErr
-		}
+			buildStart := time.Now()
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+			if err != nil {
+				return nil, fmt.Errorf("%w: %w", errCodexBuildRequest, err)
+			}
+			applyCodexHeaders(httpReq, account, stream)
+			buildDur := time.Since(buildStart)
+			dialTarget := effectiveDialTarget(httpReq.URL, e.resolveAddr)
+			log.Debugf("upstream request model=%s stream=%v account=%s attempt=%d/%d method=%s url=%s dial_target=%s", model, stream, account.GetEmail(), attemptOneBased, maxLabel, httpReq.Method, httpReq.URL.String(), dialTarget)
 
-		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			doStart := time.Now()
+			httpResp, err := e.httpClient.Do(httpReq)
+			doDur := time.Since(doStart)
+			if err != nil {
+				account.RecordFailure()
+				netErr := fmt.Errorf("请求发送失败: %w", err)
+				log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=ERR err=%v", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), err)
+				return nil, netErr
+			}
+
+			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+				log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
+				log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
+				return httpResp, nil
+			}
+
+			errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			_ = httpResp.Body.Close()
+
+			handleAccountError(account, httpResp.StatusCode, errBody)
+
+			if rc.OnAfterUpstreamErrFn != nil {
+				rc.OnAfterUpstreamErrFn(account, httpResp.StatusCode)
+			}
+
+			if httpResp.StatusCode == 429 && rc.On429RecoveryFn != nil {
+				go rc.On429RecoveryFn(context.Background(), account)
+			}
+
+			lastStatus = &StatusError{Code: httpResp.StatusCode, Body: errBody}
 			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
-			log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
-			return httpResp, nil
+
+			if httpResp.StatusCode == 401 && rc.On401Fn != nil && rc.On401Fn(account) {
+				log.Debugf("账号 [%s] 401 恢复成功，同请求内立即重试上游", account.GetEmail())
+				continue
+			}
+
+			return nil, lastStatus
 		}
-
-		errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
-		_ = httpResp.Body.Close()
-
-		handleAccountError(account, httpResp.StatusCode, errBody)
-
-		if rc.OnAfterUpstreamErrFn != nil {
-			rc.OnAfterUpstreamErrFn(account, httpResp.StatusCode)
+		if lastStatus != nil {
+			return nil, lastStatus
 		}
-
-		if httpResp.StatusCode == 401 && rc.On401Fn != nil {
-			rc.On401Fn(account)
-		}
-
-		if httpResp.StatusCode == 429 && rc.On429RecoveryFn != nil {
-			go rc.On429RecoveryFn(context.Background(), account)
-		}
-
-		statusErr := &StatusError{Code: httpResp.StatusCode, Body: errBody}
-		log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
-		return nil, statusErr
+		return nil, fmt.Errorf("请求失败")
 	}
 
 	handleSendErr := func(account *auth.Account, attempt int, err2 error) (done bool, fatal error) {
@@ -385,12 +400,11 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			}
 			break
 		}
-		excluded[account.FilePath] = true
-
 		httpResp, err2 := trySend(account, attempt+1, maxAttempts, pickDur)
 		if err2 == nil {
 			return httpResp, account, attempt + 1, nil
 		}
+		excluded[account.FilePath] = true
 		done, fatal := handleSendErr(account, attempt, err2)
 		if done {
 			return nil, nil, attempt + 1, fatal
