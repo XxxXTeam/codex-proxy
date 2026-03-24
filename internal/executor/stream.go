@@ -31,6 +31,16 @@ type CodexResponsesStream struct {
 	IncludeUsage bool
 }
 
+// CodexResponsesMeta bundles metadata returned by openCodexResponsesBody.
+type CodexResponsesMeta struct {
+	Account      *auth.Account
+	Attempts     int
+	BaseModel    string
+	ConvertDur   time.Duration
+	SendDur      time.Duration
+	ReverseTools map[string]string
+}
+
 /* prefixThenRestCloser 首读已拉取的字节 + 剩余 Body，供在返回给客户端前探测 GOAWAY 后仍能透传已读数据 */
 type prefixThenRestCloser struct {
 	prefix []byte
@@ -61,12 +71,12 @@ func (p *prefixThenRestCloser) Close() error {
 
 // openCodexResponsesBody 与 OpenCodexResponsesStream 相同：选号、sendWithRetry、首读探测空体/可重试读错并换号。
 // Claude 原始流等非 Pump 路径也经此打开，避免 200 + 空 body 导致客户端 SSE 体完全无字节。
-func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (bodyRC io.ReadCloser, account *auth.Account, attempts int, baseModel string, convertDur, sendDur time.Duration, reverseTools map[string]string, err error) {
+func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (bodyRC io.ReadCloser, meta CodexResponsesMeta, err error) {
 	convertStart := time.Now()
 	thBody, bm := thinking.ApplyThinking(requestBody, model)
-	baseModel = bm
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, thBody, true)
-	convertDur = time.Since(convertStart)
+	meta.BaseModel = bm
+	codexBody := translator.ConvertOpenAIRequestToCodex(meta.BaseModel, thBody, true)
+	meta.ConvertDur = time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 	sendStart := time.Now()
 
@@ -81,12 +91,14 @@ func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, r
 
 	for round := 0; round < readRounds; round++ {
 		if ctx.Err() != nil {
-			return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, ctx.Err()
+			meta.SendDur = time.Since(sendStart)
+			return nil, meta, ctx.Err()
 		}
 		rcExcl := MergeRetryConfigExcluded(rc, excluded)
 		httpResp, acc, att, serr := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
 		if serr != nil {
-			return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, serr
+			meta.SendDur = time.Since(sendStart)
+			return nil, meta, serr
 		}
 
 		buf := make([]byte, 32768)
@@ -99,10 +111,11 @@ func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, r
 				log.Warnf("responses-stream 首读失败，换号/重建连接重试 (%d/%d) account=%s: %v", round+1, readRounds, acc.GetEmail(), wrapReadErr(rerr))
 				continue
 			}
-			return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, fmt.Errorf("读取上游流失败: %w", wrapReadErr(rerr))
+			meta.SendDur = time.Since(sendStart)
+			return nil, meta, fmt.Errorf("读取上游流失败: %w", wrapReadErr(rerr))
 		}
 
-		sendDur = time.Since(sendStart)
+		meta.SendDur = time.Since(sendStart)
 		var br io.ReadCloser = httpResp.Body
 		if n > 0 {
 			prefix := append([]byte(nil), buf[:n]...)
@@ -115,31 +128,34 @@ func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, r
 				log.Warnf("responses-stream 上游立即 EOF，换号重试 (%d/%d) account=%s", round+1, readRounds, acc.GetEmail())
 				continue
 			}
-			return nil, nil, 0, baseModel, convertDur, sendDur, nil, fmt.Errorf("读取上游流失败: 空响应")
+			return nil, meta, fmt.Errorf("读取上游流失败: 空响应")
 		}
 
-		rt := translator.BuildReverseToolNameMap(requestBody)
-		return br, acc, att, baseModel, convertDur, sendDur, rt, nil
+		meta.Account = acc
+		meta.Attempts = att
+		meta.ReverseTools = translator.BuildReverseToolNameMap(requestBody)
+		return br, meta, nil
 	}
-	return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, fmt.Errorf("读取上游流失败")
+	meta.SendDur = time.Since(sendStart)
+	return nil, meta, fmt.Errorf("读取上游流失败")
 }
 
 // OpenCodexResponsesStream 完成选号、重试与首包前的 HTTP 往返；调用方在写入客户端 SSE 头后再 Pump。
 // 在返回前做一次首读：若立即遇 GOAWAY 等可重试错误则关连接换号重来，减少「已 200 后 pump 才断」的失败率。
 func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*CodexResponsesStream, error) {
-	bodyRC, account, attempts, baseModel, convertDur, sendDur, reverseTools, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
+	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
 	if err != nil {
 		return nil, err
 	}
 	includeUsage := gjson.GetBytes(requestBody, "stream_options.include_usage").Bool()
 	return &CodexResponsesStream{
 		body:         bodyRC,
-		account:      account,
-		Attempts:     attempts,
-		BaseModel:    baseModel,
-		ConvertDur:   convertDur,
-		SendDur:      sendDur,
-		reverseTools: reverseTools,
+		account:      meta.Account,
+		Attempts:     meta.Attempts,
+		BaseModel:    meta.BaseModel,
+		ConvertDur:   meta.ConvertDur,
+		SendDur:      meta.SendDur,
+		reverseTools: meta.ReverseTools,
 		IncludeUsage: includeUsage,
 	}, nil
 }

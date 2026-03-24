@@ -560,7 +560,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 			if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
 				continue
 			}
-			resStr, hasOutput := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
+			resStr, hasOutput := translator.ConvertNonStreamResponse(jsonData, reverseToolMap)
 			if !hasOutput {
 				break
 			}
@@ -897,11 +897,11 @@ type RawResponse struct {
  * @returns error - 请求发送失败时返回错误
  */
 func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, error) {
-	bodyRC, account, _, _, _, _, _, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
+	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &RawResponse{StatusCode: http.StatusOK, Body: bodyRC}, account, nil
+	return &RawResponse{StatusCode: http.StatusOK, Body: bodyRC}, meta.Account, nil
 }
 
 /**

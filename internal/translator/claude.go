@@ -303,12 +303,11 @@ func NewClaudeStreamState(model string) *ClaudeStreamState {
  * ConvertCodexStreamToClaudeEvents 将 Codex SSE 事件转换为 Claude Messages 流式格式
  * 每个 Codex 事件可能产生 0~N 个 Claude SSE 事件
  *
- * @param ctx - 上下文
  * @param rawLine - 原始 SSE 行数据
  * @param state - Claude 流式状态对象
  * @returns []string - "event: xxx\ndata: {...}\n\n" 格式的 SSE 事件列表
  */
-func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *ClaudeStreamState) []string {
+func ConvertCodexStreamToClaudeEvents(rawLine []byte, state *ClaudeStreamState) []string {
 	if !bytes.HasPrefix(rawLine, dataPrefix) {
 		return nil
 	}
@@ -554,12 +553,11 @@ func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *
 /**
  * ConvertCodexNonStreamToClaudeResponse 将 Codex 非流式响应转换为 Claude Messages API 格式
  *
- * @param ctx - 上下文
  * @param rawJSON - Codex response.completed 事件的 data JSON
  * @param model - 请求的模型名称
  * @returns string - Claude Messages API 格式的 JSON 字符串
  */
-func ConvertCodexNonStreamToClaudeResponse(_ context.Context, rawJSON []byte, model string) string {
+func ConvertCodexNonStreamToClaudeResponse(rawJSON []byte, model string) string {
 	root := gjson.ParseBytes(rawJSON)
 	if root.Get("type").String() != "response.completed" {
 		return ""
@@ -718,7 +716,7 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
 		}
 
 		return ClaudeNonStreamResult{
-			JSON:           ConvertCodexNonStreamToClaudeResponse(ctx, jsonData, model),
+			JSON:           ConvertCodexNonStreamToClaudeResponse(jsonData, model),
 			FoundCompleted: true,
 			HasText:        hasText,
 			HasToolUse:     hasToolUse,

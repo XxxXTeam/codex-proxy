@@ -81,7 +81,6 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 	ctx.SetStatusCode(fasthttp.StatusOK)
 
 	/* StreamWriter 内勿使用 RequestCtx（fasthttp 文档）；翻译用 Background，取消/断连由上游 Body 读错误体现 */
-	pumpCtx := context.Background()
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer func() {
 			if rawResp.Body != nil {
@@ -97,7 +96,7 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			events := translator.ConvertCodexStreamToClaudeEvents(pumpCtx, line, state)
+			events := translator.ConvertCodexStreamToClaudeEvents(line, state)
 			for _, event := range events {
 				_, _ = io.WriteString(sw, event)
 				flush()
