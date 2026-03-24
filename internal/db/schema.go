@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS codex_accounts (
 	expire VARCHAR(128),
 	plan_type VARCHAR(128),
 	last_refresh DATETIME(6) NULL,
+	status TINYINT DEFAULT 0,
+	cooldown_until DATETIME(6) NULL,
+	disable_reason VARCHAR(128),
+	last_used_at DATETIME(6) NULL,
 	updated_at DATETIME(6) NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
 	UNIQUE KEY uk_codex_accounts_account_id (account_id),
 	UNIQUE KEY uk_codex_accounts_email (email)
@@ -44,6 +48,10 @@ CREATE TABLE IF NOT EXISTS codex_accounts (
 	expire TEXT,
 	plan_type TEXT,
 	last_refresh TEXT,
+	status INTEGER DEFAULT 0,
+	cooldown_until TEXT,
+	disable_reason TEXT,
+	last_used_at TEXT,
 	updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`
 	default:
@@ -58,6 +66,10 @@ CREATE TABLE IF NOT EXISTS codex_accounts (
 	expire TEXT,
 	plan_type TEXT,
 	last_refresh TIMESTAMPTZ,
+	status SMALLINT DEFAULT 0,
+	cooldown_until TIMESTAMPTZ,
+	disable_reason TEXT,
+	last_used_at TIMESTAMPTZ,
 	updated_at TIMESTAMPTZ DEFAULT NOW()
 ) WITH (fillfactor=90)`
 	}
@@ -66,6 +78,83 @@ CREATE TABLE IF NOT EXISTS codex_accounts (
 	}
 	if err := dropLegacySecondaryIndexes(db, d); err != nil {
 		return err
+	}
+	/* 为旧表迁移：添加新的状态列 */
+	if err := migrateAddStatusColumns(db, d); err != nil {
+		return err
+	}
+	return nil
+}
+
+/* migrateAddStatusColumns 为旧表添加新的状态列 */
+func migrateAddStatusColumns(db *sql.DB, d Dialect) error {
+	switch d {
+	case DialectMySQL:
+		newCols := []string{"status", "cooldown_until", "disable_reason", "last_used_at"}
+		for _, col := range newCols {
+			if err := addColumnIfNotExists(db, d, col); err != nil {
+				return fmt.Errorf("add column %s: %w", col, err)
+			}
+		}
+	case DialectSQLite:
+		newCols := []string{"status", "cooldown_until", "disable_reason", "last_used_at"}
+		for _, col := range newCols {
+			if err := addColumnIfNotExists(db, d, col); err != nil {
+				return fmt.Errorf("add column %s: %w", col, err)
+			}
+		}
+	default: /* PostgreSQL */
+		newCols := []string{"status", "cooldown_until", "disable_reason", "last_used_at"}
+		for _, col := range newCols {
+			if err := addColumnIfNotExists(db, d, col); err != nil {
+				return fmt.Errorf("add column %s: %w", col, err)
+			}
+		}
+	}
+	return nil
+}
+
+func addColumnIfNotExists(db *sql.DB, d Dialect, colName string) error {
+	var colDef string
+	switch colName {
+	case "status":
+		switch d {
+		case DialectMySQL:
+			colDef = "TINYINT DEFAULT 0"
+		case DialectSQLite:
+			colDef = "INTEGER DEFAULT 0"
+		default: /* PostgreSQL */
+			colDef = "SMALLINT DEFAULT 0"
+		}
+	case "cooldown_until":
+		switch d {
+		case DialectMySQL:
+			colDef = "DATETIME(6) NULL"
+		case DialectSQLite:
+			colDef = "TEXT"
+		default: /* PostgreSQL */
+			colDef = "TIMESTAMPTZ"
+		}
+	case "disable_reason":
+		colDef = "VARCHAR(128)"
+	case "last_used_at":
+		switch d {
+		case DialectMySQL:
+			colDef = "DATETIME(6) NULL"
+		case DialectSQLite:
+			colDef = "TEXT"
+		default: /* PostgreSQL */
+			colDef = "TIMESTAMPTZ"
+		}
+	}
+
+	switch d {
+	case DialectMySQL:
+		_, _ = db.Exec(fmt.Sprintf("ALTER TABLE codex_accounts ADD COLUMN %s %s", mysqlBacktickIdent(colName), colDef))
+	case DialectSQLite:
+		_, _ = db.Exec(fmt.Sprintf("ALTER TABLE codex_accounts ADD COLUMN %s %s", colName, colDef))
+	default: /* PostgreSQL */
+		_, _ = db.Exec(fmt.Sprintf("ALTER TABLE codex_accounts ADD COLUMN IF NOT EXISTS %s %s", pqQuoteIdent(colName), colDef))
 	}
 	return nil
 }

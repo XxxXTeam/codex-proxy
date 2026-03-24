@@ -599,7 +599,7 @@ func loadAccountFromFile(filePath string) (*Account, error) {
 	return accountFromTokenFile(&tf, filePath)
 }
 
-func accountFromDBRow(id int64, accountID, email, idToken, accessToken, refreshToken, expire, planType sql.NullString, lastRefresh sql.NullTime) (*Account, bool) {
+func accountFromDBRow(id int64, accountID, email, idToken, accessToken, refreshToken, expire, planType sql.NullString, lastRefresh sql.NullTime, status sql.NullInt32, cooldownUntil sql.NullTime, disableReason sql.NullString, lastUsedAt sql.NullTime) (*Account, bool) {
 	if refreshToken.String == "" {
 		return nil, false
 	}
@@ -627,6 +627,21 @@ func accountFromDBRow(id int64, accountID, email, idToken, accessToken, refreshT
 	if lastRefresh.Valid {
 		acc.lastRefreshMs.Store(lastRefresh.Time.UnixMilli())
 	}
+	/* 恢复运行时状态 */
+	if status.Valid {
+		acc.Status = AccountStatus(status.Int32)
+		acc.atomicStatus.Store(status.Int32)
+	}
+	if cooldownUntil.Valid {
+		acc.CooldownUntil = cooldownUntil.Time
+		acc.atomicCooldownMs.Store(cooldownUntil.Time.UnixMilli())
+	}
+	if disableReason.Valid {
+		acc.DisableReason = disableReason.String
+	}
+	if lastUsedAt.Valid {
+		acc.LastUsedAt = lastUsedAt.Time
+	}
 	acc.SyncAccessExpireFromToken()
 	return acc, true
 }
@@ -636,7 +651,7 @@ func (m *Manager) loadAccountsFromDBSlice(ctx context.Context, offset, limit int
 	if m.db == nil {
 		return nil, 0, nil
 	}
-	base := `SELECT id, account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh FROM codex_accounts ORDER BY id`
+	base := `SELECT id, account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at FROM codex_accounts ORDER BY id`
 	var rows *sql.Rows
 	var err error
 	switch m.dbDialect {
@@ -654,13 +669,14 @@ func (m *Manager) loadAccountsFromDBSlice(ctx context.Context, offset, limit int
 	for rows.Next() {
 		rowCount++
 		var id int64
-		var accountID, email, idToken, accessToken, refreshToken, expire, planType sql.NullString
-		var lastRefresh sql.NullTime
-		if err := rows.Scan(&id, &accountID, &email, &idToken, &accessToken, &refreshToken, &expire, &planType, &lastRefresh); err != nil {
+		var accountID, email, idToken, accessToken, refreshToken, expire, planType, disableReason sql.NullString
+		var lastRefresh, cooldownUntil, lastUsedAt sql.NullTime
+		var status sql.NullInt32
+		if err := rows.Scan(&id, &accountID, &email, &idToken, &accessToken, &refreshToken, &expire, &planType, &lastRefresh, &status, &cooldownUntil, &disableReason, &lastUsedAt); err != nil {
 			log.Warnf("读取数据库账号失败: %v", err)
 			continue
 		}
-		if acc, ok := accountFromDBRow(id, accountID, email, idToken, accessToken, refreshToken, expire, planType, lastRefresh); ok {
+		if acc, ok := accountFromDBRow(id, accountID, email, idToken, accessToken, refreshToken, expire, planType, lastRefresh, status, cooldownUntil, disableReason, lastUsedAt); ok {
 			out = append(out, acc)
 		}
 	}
@@ -671,7 +687,7 @@ func (m *Manager) loadAccountsFromDB() error {
 	if m.db == nil {
 		return nil
 	}
-	rows, err := m.db.Query(`SELECT id, account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh FROM codex_accounts ORDER BY id`)
+	rows, err := m.db.Query(`SELECT id, account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at FROM codex_accounts ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -682,13 +698,14 @@ func (m *Manager) loadAccountsFromDB() error {
 
 	for rows.Next() {
 		var id int64
-		var accountID, email, idToken, accessToken, refreshToken, expire, planType sql.NullString
-		var lastRefresh sql.NullTime
-		if err := rows.Scan(&id, &accountID, &email, &idToken, &accessToken, &refreshToken, &expire, &planType, &lastRefresh); err != nil {
+		var accountID, email, idToken, accessToken, refreshToken, expire, planType, disableReason sql.NullString
+		var lastRefresh, cooldownUntil, lastUsedAt sql.NullTime
+		var status sql.NullInt32
+		if err := rows.Scan(&id, &accountID, &email, &idToken, &accessToken, &refreshToken, &expire, &planType, &lastRefresh, &status, &cooldownUntil, &disableReason, &lastUsedAt); err != nil {
 			log.Warnf("读取数据库账号失败: %v", err)
 			continue
 		}
-		acc, ok := accountFromDBRow(id, accountID, email, idToken, accessToken, refreshToken, expire, planType, lastRefresh)
+		acc, ok := accountFromDBRow(id, accountID, email, idToken, accessToken, refreshToken, expire, planType, lastRefresh, status, cooldownUntil, disableReason, lastUsedAt)
 		if !ok {
 			continue
 		}
@@ -765,9 +782,27 @@ func (m *Manager) saveTokenToDB(acc *Account) error {
 	}
 
 	acc.mu.RLock()
-	defer acc.mu.RUnlock()
+	/* 读取运行时状态：Status、CooldownUntil、DisableReason、LastUsedAt */
+	status := int(acc.Status)
+	cooldownUntil := acc.CooldownUntil
+	disableReason := acc.DisableReason
+	lastUsedAt := acc.LastUsedAt
+	args := []any{
+		acc.Token.AccountID,
+		acc.Token.Email,
+		acc.Token.IDToken,
+		acc.Token.AccessToken,
+		acc.Token.RefreshToken,
+		acc.Token.Expire,
+		acc.Token.PlanType,
+		acc.LastRefreshedAt,
+		status,
+		cooldownUntil,
+		disableReason,
+		lastUsedAt,
+	}
+	acc.mu.RUnlock()
 
-	args := []any{acc.Token.AccountID, acc.Token.Email, acc.Token.IDToken, acc.Token.AccessToken, acc.Token.RefreshToken, acc.Token.Expire, acc.Token.PlanType, acc.LastRefreshedAt}
 	aid := strings.TrimSpace(acc.Token.AccountID)
 	em := strings.TrimSpace(acc.Token.Email)
 
@@ -791,8 +826,8 @@ func (m *Manager) saveTokenToDB(acc *Account) error {
 	switch m.dbDialect {
 	case codexdb.DialectMySQL:
 		_, err := m.db.Exec(`
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES (?,?,?,?,?,?,?,?,UTC_TIMESTAMP(6))
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(6))
 ON DUPLICATE KEY UPDATE
 	email = VALUES(email),
 	account_id = VALUES(account_id),
@@ -802,12 +837,16 @@ ON DUPLICATE KEY UPDATE
 	expire = VALUES(expire),
 	plan_type = VALUES(plan_type),
 	last_refresh = VALUES(last_refresh),
+	status = VALUES(status),
+	cooldown_until = VALUES(cooldown_until),
+	disable_reason = VALUES(disable_reason),
+	last_used_at = VALUES(last_used_at),
 	updated_at = VALUES(updated_at)`, args...)
 		return err
 	case codexdb.DialectSQLite:
 		_, err := m.db.Exec(`
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
 ON CONFLICT(account_id) DO UPDATE SET
 	email = excluded.email,
 	id_token = excluded.id_token,
@@ -816,12 +855,16 @@ ON CONFLICT(account_id) DO UPDATE SET
 	expire = excluded.expire,
 	plan_type = excluded.plan_type,
 	last_refresh = excluded.last_refresh,
+	status = excluded.status,
+	cooldown_until = excluded.cooldown_until,
+	disable_reason = excluded.disable_reason,
+	last_used_at = excluded.last_used_at,
 	updated_at = CURRENT_TIMESTAMP`, args...)
 		return err
 	default:
 		_, err := m.db.Exec(`
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
 ON CONFLICT (account_id) DO UPDATE SET
 	email = EXCLUDED.email,
 	id_token = EXCLUDED.id_token,
@@ -830,6 +873,10 @@ ON CONFLICT (account_id) DO UPDATE SET
 	expire = EXCLUDED.expire,
 	plan_type = EXCLUDED.plan_type,
 	last_refresh = EXCLUDED.last_refresh,
+	status = EXCLUDED.status,
+	cooldown_until = EXCLUDED.cooldown_until,
+	disable_reason = EXCLUDED.disable_reason,
+	last_used_at = EXCLUDED.last_used_at,
 	updated_at = NOW()`, args...)
 		return err
 	}
@@ -1197,6 +1244,10 @@ func (m *Manager) applyFinalHTTPRefresh(acc *Account, email, reason string, fina
 			acc.SetCooldown(time.Duration(m.cooldown401Sec) * time.Second)
 		}
 		m.InvalidateSelectorCache()
+		/* 将冷却状态保存到数据库（数据库模式） */
+		if m.db != nil {
+			m.enqueueSave(acc)
+		}
 		log.Warnf("账号 [%s] 刷新 HTTP %d 按策略冷却", email, httpStatus)
 		return QuotaApplyCooldown
 	}
@@ -1217,6 +1268,10 @@ func (m *Manager) applyFinalHTTPQuota(acc *Account, reason string, final HTTPErr
 			acc.SetCooldown(time.Duration(m.cooldown401Sec) * time.Second)
 		}
 		m.InvalidateSelectorCache()
+		/* 将冷却状态保存到数据库（数据库模式） */
+		if m.db != nil {
+			m.enqueueSave(acc)
+		}
 		return QuotaApplyCooldown
 	}
 }
