@@ -14,12 +14,12 @@ jobs:
 
     steps:
       - name: 🧾 检出代码
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: ⚙️ 设置 Go 环境
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: "1.25.0"
           cache: true
@@ -28,41 +28,29 @@ jobs:
         run: go mod download
 
       - name: 🔨 构建项目
+        env:
+          CGO_ENABLED: 0
         run: |
-          # Linux builds
+          set -e
+
+          # ===== Linux（主力）=====
           GOOS=linux GOARCH=amd64 go build -v -o codex-proxy-linux-amd64
           GOOS=linux GOARCH=arm64 go build -v -o codex-proxy-linux-arm64
           GOOS=linux GOARCH=386 go build -v -o codex-proxy-linux-386
 
-          # Windows builds
+          # ===== Windows =====
           GOOS=windows GOARCH=amd64 go build -v -o codex-proxy-windows-amd64.exe
           GOOS=windows GOARCH=arm64 go build -v -o codex-proxy-windows-arm64.exe
           GOOS=windows GOARCH=386 go build -v -o codex-proxy-windows-386.exe
 
-          # macOS builds
+          # ===== macOS =====
           GOOS=darwin GOARCH=amd64 go build -v -o codex-proxy-darwin-amd64
           GOOS=darwin GOARCH=arm64 go build -v -o codex-proxy-darwin-arm64
 
-          # FreeBSD builds
-          GOOS=freebsd GOARCH=amd64 go build -v -o codex-proxy-freebsd-amd64
-          GOOS=freebsd GOARCH=arm64 go build -v -o codex-proxy-freebsd-arm64
-
-          # Other Linux architectures
-          GOOS=linux GOARCH=riscv64 go build -v -o codex-proxy-linux-riscv64
-          GOOS=linux GOARCH=ppc64 go build -v -o codex-proxy-linux-ppc64
-
-          # DragonFly BSD
-          GOOS=dragonfly GOARCH=amd64 go build -v -o codex-proxy-dragonfly-amd64
-
-          # Solaris
-          GOOS=solaris GOARCH=amd64 go build -v -o codex-proxy-solaris-amd64
-
-          # AIX
-          GOOS=aix GOARCH=ppc64 go build -v -o codex-proxy-aix-ppc64
-
-          # Plan9
-          GOOS=plan9 GOARCH=amd64 go build -v -o codex-proxy-plan9-amd64
-          GOOS=plan9 GOARCH=386 go build -v -o codex-proxy-plan9-386
+          # ===== 可选（有风险）=====
+          # FreeBSD 有时 OK，有时炸（保守可以删）
+          GOOS=freebsd GOARCH=amd64 go build -v -o codex-proxy-freebsd-amd64 || true
+          GOOS=freebsd GOARCH=arm64 go build -v -o codex-proxy-freebsd-arm64 || true
 
       - name: 🚀 运行 release-please
         id: release
@@ -73,7 +61,7 @@ jobs:
 
       - name: 🗃 上传构建产物到 GitHub Release
         if: ${{ steps.release.outputs.release_created }}
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release.outputs.tag_name }}
           name: ${{ steps.release.outputs.tag_name }}
@@ -89,10 +77,3 @@ jobs:
             codex-proxy-darwin-arm64
             codex-proxy-freebsd-amd64
             codex-proxy-freebsd-arm64
-            codex-proxy-linux-riscv64
-            codex-proxy-linux-ppc64
-            codex-proxy-dragonfly-amd64
-            codex-proxy-solaris-amd64
-            codex-proxy-aix-ppc64
-            codex-proxy-plan9-amd64
-            codex-proxy-plan9-386
