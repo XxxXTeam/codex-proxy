@@ -1,6 +1,8 @@
 # 账号文件（含 Token 敏感信息）
 auths/
 
+.gocache/
+
 # 配置文件（含 API Key 等敏感信息）
 config.yaml
 

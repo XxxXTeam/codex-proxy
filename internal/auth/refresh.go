@@ -7,16 +7,18 @@ package auth
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"codex-proxy/internal/netutil"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -82,32 +84,22 @@ type Refresher struct {
  * @returns *Refresher - 刷新器实例
  */
 func NewRefresher(proxyURL string, enableHTTP2 bool) *Refresher {
-	transport := &http.Transport{
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 60 * time.Second}
+	dialCtx := netutil.BuildUpstreamDialContext(dialer, proxyURL, "", "")
+	transport := netutil.NewUpstreamTransport(netutil.UpstreamTransportConfig{
+		DialContext:           dialCtx,
+		ProxyURL:              proxyURL,
 		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   200, /* auth.openai.com 单主机，需要大连接池 */
+		MaxIdleConnsPerHost:   200,
 		MaxConnsPerHost:       200,
-		IdleConnTimeout:       120 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		EnableHTTP2:           enableHTTP2,
 		ResponseHeaderTimeout: 20 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       120 * time.Second,
 		WriteBufferSize:       4 * 1024,
 		ReadBufferSize:        8 * 1024,
-		ForceAttemptHTTP2:     enableHTTP2,
 		DisableCompression:    true,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
-	}
-	if !enableHTTP2 {
-		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	}
-
-	if proxyURL != "" {
-		proxyParsed, err := url.Parse(proxyURL)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyParsed)
-		} else {
-			log.Warnf("代理地址解析失败: %v", err)
-		}
-	}
+	})
 
 	return &Refresher{
 		httpClient: &http.Client{

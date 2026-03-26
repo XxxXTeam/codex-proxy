@@ -62,15 +62,6 @@ type HTTPPoolConfig struct {
 	KeepaliveIntervalSec int /* 连接保活间隔（秒），0 使用默认 60 */
 }
 
-// getProxyScheme 提取代理 URL 的 scheme
-func getProxyScheme(proxyURL string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(proxyURL))
-	if err != nil {
-		return "", err
-	}
-	return strings.ToLower(parsed.Scheme), nil
-}
-
 /**
  * Executor Codex 请求执行器
  * 使用全局共享连接池提升高并发性能
@@ -110,26 +101,7 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		Timeout:   0,
 		KeepAlive: 60 * time.Second,
 	}
-
-	// 构建支持 SOCKS5 和 DNS 解析的 DialContext
-	var dialCtx func(context.Context, string, string) (net.Conn, error)
-	if proxyURL != "" {
-		// 先检查代理类型，确定使用方式
-		if proxyScheme, err := getProxyScheme(proxyURL); err == nil {
-			if proxyScheme == "socks5" || proxyScheme == "socks5h" {
-				// SOCKS5 代理通过 DialContext 处理
-				dialCtx = netutil.BuildProxyDialContext(dialer, proxyURL, poolCfg.BackendDomain, poolCfg.ResolveAddress)
-				log.Infof("已启用 SOCKS5 代理: %s", proxyURL)
-			} else {
-				// HTTP/HTTPS 代理由 transport.Proxy 处理
-				dialCtx = netutil.BuildResolveDialContext(dialer, poolCfg.BackendDomain, poolCfg.ResolveAddress)
-			}
-		} else {
-			dialCtx = netutil.BuildResolveDialContext(dialer, poolCfg.BackendDomain, poolCfg.ResolveAddress)
-		}
-	} else {
-		dialCtx = netutil.BuildResolveDialContext(dialer, poolCfg.BackendDomain, poolCfg.ResolveAddress)
-	}
+	dialCtx := netutil.BuildUpstreamDialContext(dialer, proxyURL, poolCfg.BackendDomain, poolCfg.ResolveAddress)
 
 	transport := netutil.NewUpstreamTransport(netutil.UpstreamTransportConfig{
 		DialContext:         dialCtx,
@@ -143,8 +115,11 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		DisableCompression:  true,
 	})
 	if proxyURL != "" {
-		if proxyScheme, err := getProxyScheme(proxyURL); err == nil {
-			if proxyScheme == "http" || proxyScheme == "https" {
+		if proxyScheme, err := netutil.ParseProxyScheme(proxyURL); err == nil {
+			switch proxyScheme {
+			case "socks5", "socks5h":
+				log.Infof("已启用 SOCKS5 代理: %s", proxyURL)
+			case "http", "https":
 				log.Infof("已启用 HTTP/HTTPS 代理: %s", proxyURL)
 			}
 		}

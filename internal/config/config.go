@@ -171,6 +171,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	cfg.Sanitize()
+	if err = cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -227,6 +230,14 @@ func (c *Config) Sanitize() {
 	}
 	if c.DBConnMaxLifetimeSec > 7200 {
 		c.DBConnMaxLifetimeSec = 7200
+	}
+	if c.ProxyURL != "" {
+		if u, err := url.Parse(c.ProxyURL); err == nil {
+			if u.Path == "/" && u.RawQuery == "" && u.Fragment == "" {
+				u.Path = ""
+				c.ProxyURL = u.String()
+			}
+		}
 	}
 	/* 优先级：base-url（若配置） > backend-domain（自动拼接） */
 	if c.BaseURL != "" {
@@ -393,6 +404,49 @@ func (c *Config) Sanitize() {
 	if err == nil {
 		log.SetLevel(level)
 	}
+}
+
+func (c *Config) Validate() error {
+	if err := validateProxyURL(c.ProxyURL); err != nil {
+		return fmt.Errorf("proxy-url 配置无效: %w", err)
+	}
+	return nil
+}
+
+func validateProxyURL(proxyURL string) error {
+	if proxyURL == "" {
+		return nil
+	}
+
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return fmt.Errorf("解析失败: %w", err)
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	switch scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return fmt.Errorf("不支持的代理协议 %q，仅支持 http/https/socks5/socks5h", u.Scheme)
+	}
+
+	if strings.TrimSpace(u.Hostname()) == "" {
+		return fmt.Errorf("缺少代理主机")
+	}
+
+	if (scheme == "socks5" || scheme == "socks5h") && strings.TrimSpace(u.Port()) == "" {
+		return fmt.Errorf("%s 代理必须显式指定端口", scheme)
+	}
+
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("不支持 query 或 fragment")
+	}
+
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("不支持路径后缀 %q", u.Path)
+	}
+
+	return nil
 }
 
 func normalizeNestedStringMap(m map[string]map[string]string) map[string]map[string]string {

@@ -1,0 +1,16 @@
+# codex-proxy overview
+- Purpose: Go-based Codex API proxy that exposes OpenAI / Claude compatible endpoints, supports multi-account rotation, internal retries, token refresh, health checks, and quota-aware selection.
+- Stack: Go 1.25, fasthttp/router, logrus, yaml.v3, tidwall gjson/sjson, SQL drivers (mysql/postgres/sqlite), golang.org/x/net and x/sync.
+- Entry point: `main.go`.
+- Main directories:
+  - `internal/auth`: account manager, token refresh, quota check, health check, HTTP status policy.
+  - `internal/config`: config loading and normalization.
+  - `internal/db`: DB abstraction and driver implementations.
+  - `internal/executor`: upstream Codex request execution and retry flow.
+  - `internal/handler`: HTTP routes and protocol adapters.
+  - `internal/netutil`: dialing, transport, retryable network error helpers.
+  - `internal/translator`: request/response translation between protocols.
+  - `internal/thinking`: model suffix / reasoning related request shaping.
+  - `internal/static`: embedded UI assets.
+- Config highlights: `proxy-url` supports HTTP / HTTPS / SOCKS5; upstream base URL defaults to ChatGPT Codex backend.
+- Environment: Windows PowerShell workspace; file encoding should stay UTF-8 without BOM.

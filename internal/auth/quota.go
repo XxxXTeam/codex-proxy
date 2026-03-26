@@ -71,7 +71,7 @@ func NewQuotaChecker(baseURL, proxyURL string, concurrency int, enableHTTP2 bool
 	}
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 60 * time.Second}
-	dialCtx := netutil.BuildResolveDialContext(dialer, backendDomain, resolveAddress)
+	dialCtx := netutil.BuildUpstreamDialContext(dialer, proxyURL, backendDomain, resolveAddress)
 	log.Debugf("quota checker dial config backend_domain=%s resolve_address=%s usage_url=%s", backendDomain, netutil.NormalizeResolveAddress(resolveAddress), usageURL)
 
 	transport := netutil.NewUpstreamTransport(netutil.UpstreamTransportConfig{
