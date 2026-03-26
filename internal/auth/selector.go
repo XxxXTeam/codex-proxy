@@ -238,10 +238,6 @@ func filterAvailable(accounts []*Account) []*Account {
 		if expMs := acc.accessExpireUnixMs.Load(); expMs > 0 && nowMs >= expMs-pickAvoidTokenExpireMarginMs {
 			continue
 		}
-		/* 刷新后异步额度探测未完成前不参与分配（额度确认成功后才视为正常） */
-		if acc.quotaProbeInFlight.Load() > 0 {
-			continue
-		}
 		available = append(available, acc)
 	}
 

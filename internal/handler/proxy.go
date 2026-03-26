@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -293,16 +294,15 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 			return h.manager.PickExcluding(model, excluded)
 		},
 		On401Fn: func(acc *auth.Account) bool {
-			/* 限制同一账号在 30 秒内最多刷新 2 次，防止陷入快速 401→刷新 循环 */
-			if !h.canPerformAuth401Recover(acc) {
-				log.Warnf("账号 [%s] 在 30 秒内刷新次数过多（>2 次），直接换号", acc.GetEmail())
+			/* 先换号让当前请求立即继续；对 401 账号在后台提交 OAuth+额度恢复（异步，不阻塞） */
+			if acc == nil {
 				return false
 			}
-
-			r := h.manager.HandleAuth401(acc, h.quotaChecker)
-			if r.Status == auth.Auth401RecoverRefreshed || r.Status == auth.Auth401RecoverCooldown429OK {
+			if h.canPerformAuth401Recover(acc) {
 				h.recordAuth401Recover(acc)
-				return true
+				h.manager.ScheduleRecoverAfterAuth401(acc, h.quotaChecker)
+			} else {
+				log.Warnf("账号 [%s] 在 30 秒内异步恢复次数过多（>2 次），跳过后台刷新", acc.GetEmail())
 			}
 			return false
 		},
@@ -316,23 +316,26 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 			h.manager.InvalidateSelectorCache()
 		},
 		QuotaCheckFn: func(ctx context.Context, acc *auth.Account) bool {
-			/* 额度检查的目的是预判账号是否有效，但结果仅供参考
-			 * 现在已在 executor 中改为：额度检查失败不排除，而是继续发送真实请求
-			 * 让上游 API 的响应（401/成功）来最终决定账号是否有效
-			 * 这样可以避免因为额度 API 网络问题导致的误判
-			 *
-			 * verdict 含义：
-			 * 1 = 有效，verdict 0/2 = 查询失败/429，verdict -1 = 无效 4xx
-			 */
-			verdict := h.quotaChecker.CheckAccountResult(ctx, acc)
-			if verdict == -1 {
-				log.Warnf("账号 [%s] 额度 API 返回 4xx（无效），但仍将尝试发送请求", acc.GetEmail())
-			} else if verdict == 0 {
-				log.Debugf("账号 [%s] 额度查询网络错误/5xx，继续尝试", acc.GetEmail())
-			} else if verdict == 2 {
-				log.Debugf("账号 [%s] 额度查询 429 限频，继续尝试", acc.GetEmail())
+			if h.quotaChecker == nil {
+				return true
 			}
-			return true /* 总是返回 true，让 executor 继续发送请求 */
+			/* verdict: 1=额度有效；0/2=暂态失败或 429，仍尝试上游；-1=明确无效，不重试浪费上游 */
+			verdict := h.quotaChecker.CheckAccountResult(ctx, acc)
+			switch verdict {
+			case 1:
+				return true
+			case -1:
+				log.Warnf("账号 [%s] 额度接口判定无效，跳过发送", acc.GetEmail())
+				return false
+			case 0:
+				log.Debugf("账号 [%s] 额度查询网络/5xx 暂态，仍尝试上游", acc.GetEmail())
+				return true
+			case 2:
+				log.Debugf("账号 [%s] 额度查询 429，仍尝试上游", acc.GetEmail())
+				return true
+			default:
+				return true
+			}
 		},
 		MaxRetry:      h.maxRetry,
 		EmptyRetryMax: h.emptyRetryMax,
@@ -345,6 +348,14 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 		}
 		/* 常规尝试用尽后，sendWithRetry 末尾再保底一次「最近成功账号」（可重试已排除的号，见 PickRecentlySuccessful） */
 		rc.FallbackRecentPickFn = healthyPick
+		/* 最后一格选号：仅快速取最近成功号，不阻塞 OAuth（刷新由周期任务/401 异步恢复完成） */
+		rc.LastAttemptPickFn = func(_ context.Context, model string, excluded map[string]bool) (*auth.Account, error) {
+			acc, err := h.manager.PickRecentlySuccessful(model, excluded)
+			if err != nil {
+				return h.manager.PickExcluding(model, excluded)
+			}
+			return acc, nil
+		}
 	}
 	return rc
 }
@@ -513,19 +524,20 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
-		up, openErr := h.executor.OpenCodexResponsesStream(ctx, rc, body, model)
-		if openErr != nil {
-			handleExecutorError(ctx, openErr)
-			return
-		}
+		/* 头与状态在 StreamWriter 外发送；Open+Pump 在 Writer 内完成，上游断连等在响应体尚无字节时可内部多轮全量重连，最后再向客户端写 SSE 错误 */
 		ctx.Response.Header.Set("Content-Type", "text/event-stream")
 		ctx.Response.Header.Set("Cache-Control", "no-cache")
 		ctx.Response.Header.Set("Connection", "keep-alive")
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 			flush := func() { _ = w.Flush() }
-			if execErr := up.PumpChatCompletion(newStreamBufWriter(w), flush); execErr != nil {
-				log.Errorf("chat stream pump: %v", execErr)
+			sw := newStreamBufWriter(w)
+			bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
+			execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, body, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
+				return s.PumpChatCompletion(w2, fl)
+			})
+			if execErr != nil {
+				log.Errorf("chat stream: %v", execErr)
 				msg, typ := chatStreamPumpErrorMeta(execErr)
 				writeOpenAIChatCompletionSSEError(w, msg, typ, true)
 				return
@@ -817,19 +829,20 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
-		up, openErr := h.executor.OpenCodexResponsesStream(ctx, rc, body, model)
-		if openErr != nil {
-			handleExecutorError(ctx, openErr)
-			return
-		}
+		/* 头与状态在 StreamWriter 外发送；Open+Pump 在 Writer 内完成，connection closed 等在体尚无字节时可内部多轮全量重连 */
 		ctx.Response.Header.Set("Content-Type", "text/event-stream")
 		ctx.Response.Header.Set("Cache-Control", "no-cache")
 		ctx.Response.Header.Set("Connection", "keep-alive")
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 			flush := func() { _ = w.Flush() }
-			if execErr := up.PumpRawSSE(newStreamBufWriter(w), flush); execErr != nil {
-				log.Errorf("responses stream pump: %v", execErr)
+			sw := newStreamBufWriter(w)
+			bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
+			execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, body, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
+				return s.PumpRawSSE(w2, fl)
+			})
+			if execErr != nil {
+				log.Errorf("responses stream: %v", execErr)
 				msg, typ := chatStreamPumpErrorMeta(execErr)
 				writeOpenAIChatCompletionSSEError(w, msg, typ, true)
 				return

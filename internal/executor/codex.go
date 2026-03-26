@@ -143,25 +143,29 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 /**
  * RetryConfig 内部重试配置
  * @field EmptyRetryMax - 空返回时最多再重试次数
- * @field QuotaCheckFn - 选号后检查额度的回调（可选）；返回 false 表示额度无效/未知，需继续换号
+ * @field QuotaCheckFn - 选号后预检；返回 false 时同 attempt 内重选，不发起上游请求
+ * @field LastAttemptPickFn - 最后一轮选号专用（与 max-retry 最后一格对齐）
  */
 type RetryConfig struct {
 	PickFn                func(model string, excluded map[string]bool) (*auth.Account, error)
 	HealthyPickFn         func(model string, excluded map[string]bool) (*auth.Account, error)
 	HealthyPickMinAttempt int /* 从第几次尝试起（0-based）改用 HealthyPickFn；0 表示主循环中不用；通常为 max-retry-1 */
 	FallbackRecentPickFn  func(model string, excluded map[string]bool) (*auth.Account, error)
-	/* On401Fn 返回 true 表示已换发新 access_token（或 429 后额度已恢复），调用方应对同一账号立即重发上游请求 */
+	/* LastAttemptPickFn 最后一轮选号专用；宜只做快速选号，避免阻塞 OAuth */
+	LastAttemptPickFn func(ctx context.Context, model string, excluded map[string]bool) (*auth.Account, error)
+	/* On401Fn 返回 true 则同号立即重发上游；false 则换号。对话场景多为 false + 异步刷新失效号 */
 	On401Fn              func(acc *auth.Account) bool
 	On429RecoveryFn      func(ctx context.Context, acc *auth.Account)
 	OnAfterUpstreamErrFn func(acc *auth.Account, statusCode int)
-	QuotaCheckFn         func(ctx context.Context, acc *auth.Account) bool /* 返回 true 表示额度有效，false 表示无效需换号 */
-	MaxRetry             int
-	EmptyRetryMax        int
+	/* QuotaCheckFn 选号后预检：返回 false 时本 attempt 内重选（不消耗上游 trySend），直至通过或选号失败 */
+	QuotaCheckFn  func(ctx context.Context, acc *auth.Account) bool
+	MaxRetry      int
+	EmptyRetryMax int
 }
 
 /**
  * MergeRetryConfigExcluded 将 extra 中的账号路径并入每次选号时的 excluded 映射。
- * 用于空响应等场景下换号重试：须与 PickFn 同样作用于 HealthyPickFn / FallbackRecentPickFn，否则会再次选到应排除的号。
+ * 用于空响应等场景下换号重试：须与 PickFn 同样作用于 HealthyPickFn / FallbackRecentPickFn / LastAttemptPickFn，否则会再次选到应排除的号。
  */
 func MergeRetryConfigExcluded(rc RetryConfig, extra map[string]bool) RetryConfig {
 	if len(extra) == 0 {
@@ -189,6 +193,13 @@ func MergeRetryConfigExcluded(rc RetryConfig, extra map[string]bool) RetryConfig
 		out.FallbackRecentPickFn = func(m string, excl map[string]bool) (*auth.Account, error) {
 			merge(excl)
 			return f(m, excl)
+		}
+	}
+	if rc.LastAttemptPickFn != nil {
+		l := rc.LastAttemptPickFn
+		out.LastAttemptPickFn = func(c context.Context, m string, excl map[string]bool) (*auth.Account, error) {
+			merge(excl)
+			return l(c, m, excl)
 		}
 	}
 	return out
@@ -226,6 +237,29 @@ func isRetryableUpstreamReadErr(err error) bool {
 	}
 	s := err.Error()
 	return strings.Contains(s, "GOAWAY") || strings.Contains(s, "ENHANCE_YOUR_CALM")
+}
+
+/* IsRetryableStreamPumpError 上游 SSE 读阶段错误是否适合在响应体仍为空时全量重连（与 isRetryableUpstreamReadErr 一致） */
+func IsRetryableStreamPumpError(err error) bool {
+	return isRetryableUpstreamReadErr(err)
+}
+
+/* IsRetryableOpenCodexError OpenCodexResponsesStream 失败是否适合在尚未写出响应体时整段重试 */
+func IsRetryableOpenCodexError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errCodexBuildRequest) {
+		return false
+	}
+	if errors.Is(err, ErrEmptyResponse) {
+		return true
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return IsRetryableStatus(se.Code)
+	}
+	return netutil.IsRetryableUpstreamNetError(err)
 }
 
 /**
@@ -375,42 +409,61 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		return false, nil
 	}
 
+	pickForAttempt := func(attempt int) (*auth.Account, error) {
+		if attempt == maxAttempts-1 && rc.LastAttemptPickFn != nil {
+			acc, err := rc.LastAttemptPickFn(ctx, model, excluded)
+			if err != nil {
+				return nil, err
+			}
+			if acc != nil {
+				log.Debugf("选号: 尝试 %d/%d 使用末次保底（最近成功号，快速选号）account=%s", attempt+1, maxAttempts, acc.GetEmail())
+			}
+			return acc, nil
+		}
+		if rc.HealthyPickMinAttempt > 0 && attempt >= rc.HealthyPickMinAttempt && rc.HealthyPickFn != nil {
+			account, err := rc.HealthyPickFn(model, excluded)
+			if err != nil {
+				return rc.PickFn(model, excluded)
+			}
+			log.Debugf("选号: 尝试 %d/%d 使用最近成功账号策略 account=%s", attempt+1, maxAttempts, account.GetEmail())
+			return account, nil
+		}
+		return rc.PickFn(model, excluded)
+	}
+
+	const maxQuotaReselects = 256
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if ctx.Err() != nil {
 			break
 		}
 
-		pickStart := time.Now()
 		var account *auth.Account
 		var err error
-		if rc.HealthyPickMinAttempt > 0 && attempt >= rc.HealthyPickMinAttempt && rc.HealthyPickFn != nil {
-			account, err = rc.HealthyPickFn(model, excluded)
+		var pickDur time.Duration
+		for q := 0; q < maxQuotaReselects; q++ {
+			pickStart := time.Now()
+			account, err = pickForAttempt(attempt)
+			pickDur = time.Since(pickStart)
 			if err != nil {
-				account, err = rc.PickFn(model, excluded)
-			} else {
-				log.Debugf("选号: 尝试 %d/%d 使用最近成功账号策略 account=%s", attempt+1, maxAttempts, account.GetEmail())
+				break
 			}
-		} else {
-			account, err = rc.PickFn(model, excluded)
+			if rc.QuotaCheckFn == nil || rc.QuotaCheckFn(ctx, account) {
+				break
+			}
+			if account != nil && account.FilePath != "" {
+				excluded[account.FilePath] = true
+			}
+			log.Debugf("账号 [%s] 额度预检未通过，同轮次重选 (%d)", account.GetEmail(), q+1)
+			account = nil
 		}
-		pickDur := time.Since(pickStart)
 		if err != nil {
 			if attempt == 0 {
 				return nil, nil, attempt + 1, err
 			}
 			break
 		}
-
-		/* 选号后检查额度（如果配置了 QuotaCheckFn）；仅在确认无效时排除，不确定时继续尝试发送 */
-		if rc.QuotaCheckFn != nil {
-			if !rc.QuotaCheckFn(ctx, account) {
-				/* QuotaCheckFn 返回 false 表示额度检查失败
-				 * 但我们不立即排除，而是继续发送请求
-				 * 让上游 API 的响应来最终决定是否需要换号
-				 * 这样可以避免因为额度检查网络问题导致的误判 */
-				log.Debugf("账号 [%s] 额度检查失败，但继续尝试发送请求", account.GetEmail())
-				/* 不加入 excluded，继续使用该账号 */
-			}
+		if account == nil {
+			break
 		}
 
 		httpResp, err2 := trySend(account, attempt+1, maxAttempts, pickDur)
@@ -535,7 +588,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 			if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
 				continue
 			}
-			resStr, hasOutput := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
+			resStr, hasOutput := translator.ConvertNonStreamResponse(jsonData, reverseToolMap)
 			if !hasOutput {
 				break
 			}
@@ -554,6 +607,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 				break
 			}
 		}
+		scanErr := scanner.Err()
 		_ = httpResp.Body.Close()
 
 		if gotValid && len(result) > 0 {
@@ -561,9 +615,17 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 			return result, nil
 		}
-		/* 空回答时标记账号失败，防止下一个请求继续选择该账号 */
+		/* 空回答或读错误时标记账号失败，防止下一个请求继续选择该账号 */
 		account.RecordFailure()
 		excludedForEmpty[account.FilePath] = true
+		if scanErr != nil {
+			if isRetryableUpstreamReadErr(scanErr) && emptyAttempt < emptyRetryMax {
+				log.Warnf("nonstream 读 SSE 失败，换号重试 (%d/%d) account=%s: %v", emptyAttempt+1, emptyRetryMax+1, account.GetEmail(), wrapReadErr(scanErr))
+				continue
+			}
+			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+			return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(scanErr))
+		}
 		if emptyAttempt < emptyRetryMax {
 			log.Warnf("非流式空返回，换号重试 (account=%s attempt=%d/%d)", account.GetEmail(), emptyAttempt+1, emptyRetryMax+1)
 		}
@@ -872,11 +934,11 @@ type RawResponse struct {
  * @returns error - 请求发送失败时返回错误
  */
 func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, error) {
-	bodyRC, account, _, _, _, _, _, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
+	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &RawResponse{StatusCode: http.StatusOK, Body: bodyRC}, account, nil
+	return &RawResponse{StatusCode: http.StatusOK, Body: bodyRC}, meta.Account, nil
 }
 
 /**

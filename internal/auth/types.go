@@ -108,9 +108,6 @@ type Account struct {
 
 	/* 上游 429 后的额度恢复流程，防止同一账号堆积多个恢复 goroutine */
 	upstream429Recovering atomic.Int32
-
-	/* quotaProbeInFlight OAuth 刷新成功后异步 wham/usage 进行中的计数；>0 时不参与选号，额度 200 确认后才视为正常可用 */
-	quotaProbeInFlight atomic.Int32
 }
 
 /**

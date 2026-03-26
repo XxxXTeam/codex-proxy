@@ -1037,10 +1037,6 @@ func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Accoun
 }
 
 /**
- * PickRecentlySuccessful 在换号重试仍失败时作为回退：选取最近一次成功完成请求的账号（LastUsedAt 最新）。
- * 优先选择本轮尚未尝试过的账号；若均已尝试则仍取全局最近成功者。
- */
-/**
  * PickRecentlySuccessful 回退选择：优先选最近成功且非排除的账号；所有都排除时清空排除列表重选正常账号
  */
 func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool) (*Account, error) {
@@ -1056,9 +1052,6 @@ func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool)
 		if st == StatusDisabled || st == StatusCooldown {
 			continue
 		}
-		if acc.quotaProbeInFlight.Load() > 0 {
-			continue
-		}
 		t := acc.GetLastUsedAt()
 		if t.IsZero() {
 			continue
@@ -1071,9 +1064,6 @@ func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool)
 		for _, acc := range allAccounts {
 			st := AccountStatus(acc.atomicStatus.Load())
 			if st == StatusDisabled || st == StatusCooldown {
-				continue
-			}
-			if acc.quotaProbeInFlight.Load() > 0 {
 				continue
 			}
 			/* 找到任何正常账号就用 */
@@ -1550,24 +1540,6 @@ func (m *Manager) afterRefreshValidateQuota(ctx context.Context, qc *QuotaChecke
 	return m.applyPostRefreshQuotaOutcome(ctx, qc, acc, false)
 }
 
-/**
- * runAsyncPostRefreshQuotaCheck 周期/强制刷新后的异步额度探测（不在选号池中直至探测结束）
- */
-func (m *Manager) runAsyncPostRefreshQuotaCheck(ctx context.Context, acc *Account) {
-	qc := m.postRefreshQuota.Load()
-	if qc == nil || acc == nil {
-		return
-	}
-	fp := acc.FilePath
-	m.mu.RLock()
-	still := fp != "" && m.accountIndex[fp] == acc
-	m.mu.RUnlock()
-	if !still {
-		return
-	}
-	_ = m.applyPostRefreshQuotaOutcome(ctx, qc, acc, true)
-}
-
 /* applyPostRefreshQuotaOutcome 根据 wham/usage 结果处理账号；asyncLog 为 true 时用「异步」文案 */
 func (m *Manager) applyPostRefreshQuotaOutcome(ctx context.Context, qc *QuotaChecker, acc *Account, asyncLog bool) bool {
 	verdict, st := qc.CheckAccountResultWithStatus(ctx, acc)
@@ -1594,26 +1566,6 @@ func (m *Manager) applyPostRefreshQuotaOutcome(ctx context.Context, qc *QuotaChe
 		}
 		return true
 	}
-}
-
-/**
- * spawnPostRefreshQuotaProbe OAuth 成功后启动异步额度校验；校验完成前账号不参与选号
- */
-func (m *Manager) spawnPostRefreshQuotaProbe(acc *Account) {
-	if m == nil || acc == nil || m.postRefreshQuota.Load() == nil {
-		return
-	}
-	acc.quotaProbeInFlight.Add(1)
-	m.InvalidateSelectorCache()
-	go func(a *Account) {
-		defer func() {
-			a.quotaProbeInFlight.Add(-1)
-			m.InvalidateSelectorCache()
-		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		m.runAsyncPostRefreshQuotaCheck(ctx, a)
-	}(acc)
 }
 
 /**
@@ -2084,7 +2036,14 @@ func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
 	acc.UpdateToken(*td)
 	m.enqueueSave(acc)
 	log.Infof("账号 [%s] 刷新成功", acc.GetEmail())
-	m.spawnPostRefreshQuotaProbe(acc)
+	if qcEff := m.effectiveQuotaAfterRefresh(nil); qcEff != nil {
+		qctx, qcancel := context.WithTimeout(ctx, 30*time.Second)
+		if !m.afterRefreshValidateQuota(qctx, qcEff, acc) {
+			qcancel()
+			return false
+		}
+		qcancel()
+	}
 	return true
 }
 
@@ -2275,9 +2234,34 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 }
 
 /**
- * HandleAuth401 处理请求返回 401 的账号
- * 采用同步刷新策略：阻塞当前请求，同步刷新 Token，直到成功/失败/超时
- * 然后返回刷新结果：成功则重试当前账号，失败则需切换账号
+ * ScheduleRecoverAfterAuth401 在后台对曾返回 401 的账号执行与 RecoverAuth401 相同的刷新与额度流程，不阻塞当前请求。
+ * 供对话代理「先换号继续、异步救号」策略使用；与 RecoverAuth401 共享 singleflight，重复提交会合并。
+ */
+func (m *Manager) ScheduleRecoverAfterAuth401(acc *Account, qc *QuotaChecker) {
+	if m == nil || acc == nil {
+		return
+	}
+	a := acc
+	q := qc
+	go func() {
+		timeoutSec := m.refreshSingleTimeoutSec
+		if timeoutSec < 1 {
+			timeoutSec = defaultRefreshSingleTimeoutSec
+		}
+		hctx, hcancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+35)*time.Second)
+		defer hcancel()
+		out := m.RecoverAuth401(hctx, a, q)
+		switch out.Status {
+		case Auth401RecoverRefreshed, Auth401RecoverCooldown429OK:
+			log.Infof("异步 401 恢复成功: %s", a.GetEmail())
+		default:
+			log.Debugf("异步 401 恢复结束 [%s]: status=%s detail=%s", a.GetEmail(), out.Status, out.Detail)
+		}
+	}()
+}
+
+/**
+ * HandleAuth401 同步刷新 401 账号（管理接口等需等待结果时使用）；对话路径请用 ScheduleRecoverAfterAuth401。
  * @param acc - 返回 401 的账号
  * @param qc - 额度查询器，可为 nil（此时刷新 429 视为无法复核，直接禁用）
  */
@@ -2423,7 +2407,14 @@ func (m *Manager) refreshAccount(ctx context.Context, acc *Account) {
 	acc.UpdateToken(*td)
 	m.enqueueSave(acc)
 	log.Infof("账号 [%s] 刷新成功", acc.GetEmail())
-	m.spawnPostRefreshQuotaProbe(acc)
+	if qcEff := m.effectiveQuotaAfterRefresh(nil); qcEff != nil {
+		qctx, qcancel := context.WithTimeout(ctx, 30*time.Second)
+		if !m.afterRefreshValidateQuota(qctx, qcEff, acc) {
+			qcancel()
+			return
+		}
+		qcancel()
+	}
 }
 
 /**

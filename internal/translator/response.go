@@ -76,7 +76,7 @@ func NewStreamState(model string) *StreamState {
  *   - response.function_call_arguments.delta → tool_calls arguments
  *   - response.completed → finish_reason
  *
- * @param ctx - 上下文
+ * @param ctx - 上下文（当前未使用，预留用于将来添加取消/超时控制或保持与现有接口一致）
  * @param rawLine - 原始 SSE 行数据
  * @param state - 流式状态对象
  * @param reverseToolMap - 缩短名→原始名的工具名映射
@@ -357,12 +357,11 @@ func BuildChatCompletionStreamUsageOnlyChunk(state *StreamState) string {
 /**
  * ConvertNonStreamResponse 将 Codex 非流式响应转换为 OpenAI Chat Completions 格式
  *
- * @param ctx - 上下文
  * @param rawJSON - Codex 完整响应 JSON（response.completed 事件的 data 部分）
  * @param reverseToolMap - 缩短名→原始名的工具名映射
  * @returns string - OpenAI Chat Completions 格式的 JSON 字符串
  */
-func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap map[string]string) (string, bool) {
+func ConvertNonStreamResponse(rawJSON []byte, reverseToolMap map[string]string) (string, bool) {
 	root := gjson.ParseBytes(rawJSON)
 	if root.Get("type").String() != "response.completed" {
 		return "", false

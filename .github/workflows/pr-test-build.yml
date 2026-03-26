@@ -1,0 +1,31 @@
+# 参考 CLIProxyAPIPlus：在 PR 上验证可编译，避免合入后才发现构建失败
+name: pr-test-build
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -buildvcs=false -ldflags='-s -w' -o /tmp/codex-proxy .
+          rm -f /tmp/codex-proxy

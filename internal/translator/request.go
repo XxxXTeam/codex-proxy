@@ -495,12 +495,6 @@ func buildShortNameMap(names []string) map[string]string {
 	}
 	return m
 }
-
-/**
- * ensureInputContainsJSON 当 text.format.type 为 json_object 或 json_schema 时，
- * 若 instructions 与 input 消息中均未出现 "json"（不区分大小写），则向 instructions 前追加提示，
- * 满足上游「input 须包含 json」的校验，避免 400。
- */
 func ensureInputContainsJSON(body []byte) []byte {
 	ft := strings.ToLower(gjson.GetBytes(body, "text.format.type").String())
 	if ft != "json_object" && ft != "json_schema" {
@@ -508,28 +502,48 @@ func ensureInputContainsJSON(body []byte) []byte {
 	}
 	needle := "json"
 	hasJSON := func(s string) bool { return strings.Contains(strings.ToLower(s), needle) }
-	if hasJSON(gjson.GetBytes(body, "instructions").String()) {
-		return body
-	}
-	input := gjson.GetBytes(body, "input")
-	if input.IsArray() {
-		for _, it := range input.Array() {
+
+	inputNode := gjson.GetBytes(body, "input")
+	if inputNode.Exists() && inputNode.IsArray() {
+		for _, it := range inputNode.Array() {
 			if it.Get("type").String() != "message" {
 				continue
 			}
 			for _, c := range it.Get("content").Array() {
-				if t := c.Get("text").String(); hasJSON(t) {
+				if hasJSON(c.Get("text").String()) {
 					return body
 				}
 			}
 		}
 	}
-	inst := gjson.GetBytes(body, "instructions").String()
-	newInst := "Respond in JSON format."
-	if inst != "" {
-		newInst = newInst + "\n\n" + inst
+
+	synth := json.RawMessage(`{"type":"message","role":"developer","content":[{"type":"input_text","text":"Respond in JSON format."}]}`)
+
+	if !inputNode.Exists() || !inputNode.IsArray() {
+		wrapped, err := json.Marshal([]json.RawMessage{synth})
+		if err != nil {
+			return body
+		}
+		out, err := sjson.SetRawBytes(body, "input", wrapped)
+		if err != nil {
+			return body
+		}
+		return out
 	}
-	out, _ := sjson.SetBytes(body, "instructions", newInst)
+
+	var items []json.RawMessage
+	if err := json.Unmarshal([]byte(inputNode.Raw), &items); err != nil {
+		return body
+	}
+	newItems := append([]json.RawMessage{synth}, items...)
+	newInput, err := json.Marshal(newItems)
+	if err != nil {
+		return body
+	}
+	out, err := sjson.SetRawBytes(body, "input", newInput)
+	if err != nil {
+		return body
+	}
 	return out
 }
 

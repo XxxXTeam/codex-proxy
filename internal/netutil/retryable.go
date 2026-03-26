@@ -19,17 +19,19 @@ func IsRetryableUpstreamNetError(err error) bool {
 		return true
 	}
 
-	s := err.Error()
+	s := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(s, "GOAWAY"):
+	case strings.Contains(s, "goaway"):
 		return true
-	case strings.Contains(s, "ENHANCE_YOUR_CALM"):
+	case strings.Contains(s, "enhance_your_calm"):
+		return true
+	case strings.Contains(s, "connection closed"):
 		return true
 	case strings.Contains(s, "connection reset"):
 		return true
 	case strings.Contains(s, "broken pipe"):
 		return true
-	case strings.Contains(s, "unexpected EOF"):
+	case strings.Contains(s, "unexpected eof"):
 		return true
 	case strings.Contains(s, "server closed idle connection"):
 		return true
@@ -37,7 +39,7 @@ func IsRetryableUpstreamNetError(err error) bool {
 		return true
 	case strings.Contains(s, "transport connection broken"):
 		return true
-	case strings.Contains(s, "TLS handshake timeout"):
+	case strings.Contains(s, "tls handshake timeout"):
 		return true
 	case strings.Contains(s, "i/o timeout"):
 		return true
