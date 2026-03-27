@@ -1,189 +1,87 @@
-name: Release
+name: 发布发行版
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+  push:
+    branches:
+      - master
 
 permissions:
   contents: write
   packages: write
-  actions: write
-
-env:
-  GOFLAGS: '-trimpath -buildvcs=false'
-  LDFLAGS: '-s -w'
 
 jobs:
-  build-zip:
-    name: ${{ matrix.slug }}
+  release:
+    name: 📦 Release
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 16
-      matrix:
-        include:
-          # Linux
-          - { goos: linux, goarch: amd64, slug: linux-amd64 }
-          - { goos: linux, goarch: '386', slug: linux-386 }
-          - { goos: linux, goarch: arm64, slug: linux-arm64 }
-          - { goos: linux, goarch: arm, goarm: '7', slug: linux-armv7 }
-          # Windows
-          - { goos: windows, goarch: amd64, slug: windows-amd64 }
-          - { goos: windows, goarch: '386', slug: windows-386 }
-          - { goos: windows, goarch: arm64, slug: windows-arm64 }
-          # macOS
-          - { goos: darwin, goarch: amd64, slug: darwin-amd64 }
-          - { goos: darwin, goarch: arm64, slug: darwin-arm64 }
+
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build & zip
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: '0'
-        run: |
-          set -euo pipefail
-          if [ -n "${{ matrix.goarm }}" ]; then export GOARM="${{ matrix.goarm }}"; fi
-          mkdir -p pack
-          if [ "$GOOS" = "windows" ]; then BIN="codex-proxy.exe"; else BIN="codex-proxy"; fi
-          go build -ldflags="${{ env.LDFLAGS }}" -o "pack/$BIN" .
-          cp config.example.yaml pack/config.yaml
-          ZIP="codex-proxy-${{ matrix.slug }}.zip"
-          (cd pack && zip -r "../$ZIP" .)
-          unzip -l "$ZIP"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zip-${{ matrix.slug }}
-          path: codex-proxy-${{ matrix.slug }}.zip
-
-  publish-release:
-    name: GitHub Release
-    runs-on: ubuntu-latest
-    needs: build-zip
-    if: startsWith(github.ref, 'refs/tags/')
-
-    steps:
-      - uses: actions/checkout@v4
+      - name: 🧾 检出代码
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}
 
-      - name: 生成发行说明
+      - name: ⚙️ 设置 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+          cache: true
+
+      - name: 📦 下载依赖
+        run: go mod download
+
+      - name: 🔨 构建项目
         env:
-          CURRENT_TAG: ${{ github.ref_name }}
+          CGO_ENABLED: 0
         run: |
-          set -euo pipefail
-          mapfile -t TAGS < <(git tag -l 'v*' --sort=-version:refname)
-          PREV_TAG=""
-          for i in "${!TAGS[@]}"; do
-            if [[ "${TAGS[$i]}" == "$CURRENT_TAG" ]]; then
-              j=$((i + 1))
-              if (( j < ${#TAGS[@]} )); then
-                PREV_TAG="${TAGS[$j]}"
-              fi
-              break
-            fi
-          done
-
-          {
-            echo "## 提交记录 (${CURRENT_TAG})"
-            echo
-            if [[ -n "$PREV_TAG" ]]; then
-              echo "自上一发行标签 \`${PREV_TAG}\` 起至 \`${CURRENT_TAG}\` 的提交（按时间正序）："
-            else
-              echo "首个匹配 \`v*\` 的发行标签；以下为指向该 tag 的提交历史（按时间正序）："
-            fi
-            echo
-            if [[ -n "$PREV_TAG" ]]; then
-              git log "${PREV_TAG}..${CURRENT_TAG}" --reverse --pretty=format:'### %s%n%n- **哈希** \`%h\` · **作者** %an · **日期** %ad%n%n%b%n' --date=short
-            else
-              git log "${CURRENT_TAG}" --reverse --pretty=format:'### %s%n%n- **哈希** \`%h\` · **作者** %an · **日期** %ad%n%n%b%n' --date=short
-            fi
-            echo
-            echo '---'
-            echo
-            echo '*以下为 GitHub 自动生成的对比摘要（含合并的 PR 等）：*'
-            echo
-          } > release_notes.md
-
-          if [[ -n "$PREV_TAG" ]]; then
-            git log "${PREV_TAG}..${CURRENT_TAG}" --reverse --pretty=format:'%h %s' > commit_list_plain.txt
-          else
-            git log "${CURRENT_TAG}" --reverse --pretty=format:'%h %s' > commit_list_plain.txt
-          fi
-      # 勿在本 step 使用 if: ${{ secrets.* }}：GitHub 的 job/step 条件表达式不支持 secrets，会报「未识别的命名值 secrets」。用下方 env 注入 + run 内 [ -z "$GH_TOKEN" ] 跳过即可。
-      - name: GitHub Copilot CLI 生成发行摘要（可选）
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-          CI: "true"
-          NO_COLOR: "1"
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "未配置 secret COPILOT_GITHUB_TOKEN，跳过 Copilot 摘要"
-            exit 0
-          fi
-          if [ ! -s commit_list_plain.txt ]; then
-            exit 0
-          fi
-          curl -fsSL https://gh.io/copilot-install | PREFIX="$HOME/.local" bash
-          export PATH="$HOME/.local/bin:$PATH"
-          set +e
-          head -c 120000 commit_list_plain.txt | copilot -p "以下是本版本 Git 提交列表（stdin，每行：短哈希 + 标题）。请只输出 Markdown：二级标题「## Copilot 摘要」，下列中文无序列表归纳可验证的变更（可合并同类项，约 24 条内）。禁止编造提交中未体现的内容。" --no-ask-user > copilot_summary.md 2>&1
-          rc=$?
           set -e
-          if [ "$rc" != 0 ] || [ ! -s copilot_summary.md ]; then
-            echo "Copilot CLI 失败 (exit $rc) 或无输出，发布说明不含 Copilot 摘要"
-            head -c 2000 copilot_summary.md 2>/dev/null || true
-            rm -f copilot_summary.md
-            exit 0
-          fi
-          sed -i 's/\x1b\[[0-9;]*m//g' copilot_summary.md 2>/dev/null || true
-          {
-            cat copilot_summary.md
-            echo
-            echo '---'
-            echo
-            cat release_notes.md
-          } > release_notes_merged.md
-          mv release_notes_merged.md release_notes.md
 
-      - uses: actions/download-artifact@v4
+          # Linux
+          GOOS=linux GOARCH=amd64 go build -o codex-proxy-linux-amd64
+          GOOS=linux GOARCH=arm64 go build -o codex-proxy-linux-arm64
+          GOOS=linux GOARCH=386 go build -o codex-proxy-linux-386
+
+          # Windows
+          GOOS=windows GOARCH=amd64 go build -o codex-proxy-windows-amd64.exe
+          GOOS=windows GOARCH=arm64 go build -o codex-proxy-windows-arm64.exe
+          GOOS=windows GOARCH=386 go build -o codex-proxy-windows-386.exe
+
+          # macOS
+          GOOS=darwin GOARCH=amd64 go build -o codex-proxy-darwin-amd64
+          GOOS=darwin GOARCH=arm64 go build -o codex-proxy-darwin-arm64
+
+      - name: 🚀 release-please
+        id: release
+        uses: googleapis/release-please-action@v4
         with:
-          path: dist
-          pattern: zip-*
-          merge-multiple: true
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
 
-      - name: SHA256
-        working-directory: dist
-        run: |
-          shopt -s nullglob
-          z=( *.zip )
-          [ ${#z[@]} -ge 1 ] || { ls -la; exit 1; }
-          sha256sum "${z[@]}" | tee SHA256SUMS.txt
-
-      - uses: softprops/action-gh-release@v2
+      - name: 🗃 上传 Release 资产
+        if: ${{ steps.release.outputs.release_created }}
+        uses: softprops/action-gh-release@v2
         with:
-          body_path: release_notes.md
-          generate_release_notes: true
+          tag_name: ${{ steps.release.outputs.tag_name }}
+          name: ${{ steps.release.outputs.tag_name }}
+          body: ${{ steps.release.outputs.release_notes }}
           files: |
-            dist/*.zip
-            dist/SHA256SUMS.txt
-
+            codex-proxy-linux-amd64
+            codex-proxy-linux-arm64
+            codex-proxy-linux-386
+            codex-proxy-windows-amd64.exe
+            codex-proxy-windows-arm64.exe
+            codex-proxy-windows-386.exe
+            codex-proxy-darwin-amd64
+            codex-proxy-darwin-arm64
   docker:
     name: Docker
     runs-on: ubuntu-latest
+    needs: release
+    if: ${{ needs.release.outputs.release_created == 'true' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -206,16 +104,16 @@ jobs:
         with:
           images: ${{ steps.ghcr.outputs.image }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag_name }}
+            type=raw,value=latest
             type=sha,prefix=
 
       - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
