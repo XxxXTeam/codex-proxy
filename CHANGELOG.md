@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.2.0...v1.2.1) (2026-03-30)
+
+
+### 🐛 错误修复
+
+* 修复在auth文件为空时的panic问题，支持rk为空或null的支持 ([4214ee9](https://github.com/XxxXTeam/codex-proxy/commit/4214ee9b6d30657cdb26d84ae5c4d75d433dbfbe))
+
 ## [1.2.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.1.5...v1.2.0) (2026-03-27)
 
 
