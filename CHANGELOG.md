@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.2.0...v1.2.1) (2026-03-30)
+
+
+### 🐛 错误修复
+
+* 修复在auth文件为空时的panic问题，支持rk为空或null的支持 ([4214ee9](https://github.com/XxxXTeam/codex-proxy/commit/4214ee9b6d30657cdb26d84ae5c4d75d433dbfbe))
+
+
+### 📦 依赖更新
+
+* **ci:** bump actions/checkout from 4 to 6 ([#14](https://github.com/XxxXTeam/codex-proxy/issues/14)) ([ed47be0](https://github.com/XxxXTeam/codex-proxy/commit/ed47be0f38666a716f7a83973748886b0303a7a2))
+* **ci:** bump actions/setup-go from 5 to 6 ([#15](https://github.com/XxxXTeam/codex-proxy/issues/15)) ([3dda587](https://github.com/XxxXTeam/codex-proxy/commit/3dda5878976d19aa7b9f443f33909773cdae21e1))
+* **go:** bump modernc.org/sqlite from 1.47.0 to 1.48.0 ([#13](https://github.com/XxxXTeam/codex-proxy/issues/13)) ([955d498](https://github.com/XxxXTeam/codex-proxy/commit/955d4987eac279f08ac0002fdc40c59791d34acd))
+
 ## [1.2.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.1.5...v1.2.0) (2026-03-27)
 
 
