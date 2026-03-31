@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.3.0...v1.4.0) (2026-03-31)
+
+
+### ✨ 新功能
+
+* 支持自适应连接池配置，优化请求与转发性能 ([b73d9a1](https://github.com/XxxXTeam/codex-proxy/commit/b73d9a10b3a5325bbed85df4630ac5ee906f3339))
+
+
+### 🐛 错误修复
+
+* 优化工作流打包文件错误问题 ([2381ddb](https://github.com/XxxXTeam/codex-proxy/commit/2381ddb4deec2405e82a6b94c3339ada23954b3f))
+* 修复工作流配置权限错误问题 ([1ed95c9](https://github.com/XxxXTeam/codex-proxy/commit/1ed95c9459cb751b079c7b5ac3feccefd8f800d4))
+
 ## [1.3.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.2.1...v1.3.0) (2026-03-31)
 
 
