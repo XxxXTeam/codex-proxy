@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.2.1...v1.3.0) (2026-03-31)
+
+
+### ✨ 新功能
+
+* 适配1m模型，修复fast模型参数传递问题，性能优化 ([3906118](https://github.com/XxxXTeam/codex-proxy/commit/3906118993315ee813f919e96c14b40dfc5fe3ac))
+
 ## [1.2.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.2.0...v1.2.1) (2026-03-30)
 
 
