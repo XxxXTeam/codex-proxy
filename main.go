@@ -102,6 +102,19 @@ func main() {
 	}
 	log.Infof("刷新间隔: %d 秒", cfg.RefreshInterval)
 	log.Infof("最大重试: %d 次", cfg.MaxRetry)
+	if cfg.UpstreamPoolAutoScale {
+		log.Infof("出站连接池(自适应): max-conns-per-host=%d max-idle-per-host=%d max-idle=%d tcp_nodelay=on",
+			cfg.MaxConnsPerHost, cfg.MaxIdleConnsPerHost, cfg.MaxIdleConns)
+	} else {
+		log.Infof("出站连接池(手动): max-conns-per-host=%d max-idle-per-host=%d max-idle=%d tcp_nodelay=on",
+			cfg.MaxConnsPerHost, cfg.MaxIdleConnsPerHost, cfg.MaxIdleConns)
+	}
+	if cfg.ListenConcurrency > 0 {
+		log.Infof("入站 fasthttp 最大并发连接: %d", cfg.ListenConcurrency)
+	}
+	if cfg.UpstreamResponseHeaderTimeoutSec > 0 {
+		log.Infof("出站响应头超时: %d 秒", cfg.UpstreamResponseHeaderTimeoutSec)
+	}
 	if cfg.HealthCheckInterval > 0 {
 		log.Infof("健康检查: 每 %d 秒, 并发 %d, 连续失败 %d 次禁用",
 			cfg.HealthCheckInterval, cfg.HealthCheckConcurrency, cfg.HealthCheckMaxFailures)
@@ -157,6 +170,7 @@ func main() {
 		QuotaHTTPStatusPolicy:         cfg.QuotaHTTPStatusPolicy,
 		Auth401SyncRefreshConcurrency: cfg.Auth401SyncRefreshConcurrency,
 		DBDialect:                     dbDialect,
+		QuotaPrecheck:                 cfg.QuotaPrecheck,
 	}
 	manager := auth.NewManager(cfg.AuthDir, db, cfg.ProxyURL, cfg.RefreshInterval, selector, cfg.EnableHTTP2, managerOpts)
 	manager.SetRefreshConcurrency(cfg.RefreshConcurrency)
@@ -264,16 +278,17 @@ func main() {
 
 	/* 初始化执行器 */
 	exec := executor.NewExecutor(cfg.BaseURL, cfg.ProxyURL, executor.HTTPPoolConfig{
-		MaxConnsPerHost:         cfg.MaxConnsPerHost,
-		MaxIdleConns:            cfg.MaxIdleConns,
-		MaxIdleConnsPerHost:     cfg.MaxIdleConnsPerHost,
-		EnableHTTP2:             cfg.EnableHTTP2,
-		BackendDomain:           cfg.BackendDomain,
-		ResolveAddress:          cfg.BackendResolveAddress,
-		KeepaliveIntervalSec:    cfg.KeepaliveInterval,
-		IdleConnTimeoutSec:      cfg.UpstreamIdleConnTimeoutSec,
-		TLSHandshakeTimeoutSec:  cfg.UpstreamTLSHandshakeTimeoutSec,
-		HTTP2MaxConnsPerHostCap: cfg.HTTP2MaxConnsPerHostCap,
+		MaxConnsPerHost:          cfg.MaxConnsPerHost,
+		MaxIdleConns:             cfg.MaxIdleConns,
+		MaxIdleConnsPerHost:      cfg.MaxIdleConnsPerHost,
+		EnableHTTP2:              cfg.EnableHTTP2,
+		BackendDomain:            cfg.BackendDomain,
+		ResolveAddress:           cfg.BackendResolveAddress,
+		KeepaliveIntervalSec:     cfg.KeepaliveInterval,
+		IdleConnTimeoutSec:       cfg.UpstreamIdleConnTimeoutSec,
+		TLSHandshakeTimeoutSec:   cfg.UpstreamTLSHandshakeTimeoutSec,
+		HTTP2MaxConnsPerHostCap:  cfg.HTTP2MaxConnsPerHostCap,
+		ResponseHeaderTimeoutSec: cfg.UpstreamResponseHeaderTimeoutSec,
 	})
 
 	/* 延迟启动连接池保活（在服务启动后异步进行） */
@@ -285,7 +300,7 @@ func main() {
 
 	/* 初始化 HTTP 服务 */
 	r := router.New()
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, static.IndexHTML)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.QuotaPrecheck, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, static.IndexHTML)
 	proxyHandler.RegisterRoutes(r)
 
 	appHandler := r.Handler
@@ -299,6 +314,7 @@ func main() {
 		Handler:          appHandler,
 		Name:             "Codex Proxy",
 		DisableKeepalive: false,
+		Concurrency:      cfg.ListenConcurrency,
 		IdleTimeout:      time.Duration(cfg.ListenIdleTimeoutSec) * time.Second,
 		ReadTimeout:      0,
 		WriteTimeout:     0,

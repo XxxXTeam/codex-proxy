@@ -56,6 +56,8 @@ type ManagerOptions struct {
 	Auth401SyncRefreshConcurrency int
 	/* DBDialect 持久化时使用，与 internal/db 方言一致；零值等价于 PostgreSQL */
 	DBDialect codexdb.Dialect
+	/* QuotaPrecheck 为 true 时，401 恢复路径在 OAuth 成功后仍跑 wham/usage；false 时仅刷新 Token，交周期刷新/上游错误处置 */
+	QuotaPrecheck bool
 }
 
 /**
@@ -101,6 +103,8 @@ type Manager struct {
 	auth401SyncSem chan struct{}
 	/* postRefreshQuota OAuth 刷新成功后用于立刻校验 wham/usage；nil 表示不校验（由 SetPostRefreshQuotaChecker 注入） */
 	postRefreshQuota atomic.Pointer[QuotaChecker]
+	/* quotaPrecheck 见 ManagerOptions.QuotaPrecheck；false 时 recoverAuth401Once 不在刷新后查 wham */
+	quotaPrecheck bool
 }
 
 /**
@@ -156,6 +160,7 @@ func NewManager(authDir string, db *sql.DB, proxyURL string, refreshInterval int
 		if opts.Auth401SyncRefreshConcurrency > 0 {
 			m.auth401SyncSem = make(chan struct{}, opts.Auth401SyncRefreshConcurrency)
 		}
+		m.quotaPrecheck = opts.QuotaPrecheck
 	}
 	m.refreshHTTPPolicy = mergeRefreshHTTPPolicies(opts)
 	m.quotaHTTPPolicy = mergeQuotaHTTPPolicies(opts)
@@ -188,15 +193,21 @@ func (m *Manager) waitAccountRefreshIdle(ctx context.Context, acc *Account) bool
 	if acc.refreshing.Load() == 0 {
 		return true
 	}
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
+	delay := 5 * time.Millisecond
+	const maxDelay = 50 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
 			return false
-		case <-ticker.C:
+		case <-time.After(delay):
 			if acc.refreshing.Load() == 0 {
 				return true
+			}
+			if delay < maxDelay {
+				delay *= 2
+				if delay > maxDelay {
+					delay = maxDelay
+				}
 			}
 		}
 	}
@@ -958,18 +969,13 @@ func (m *Manager) deleteAccountFromDB(acc *Account) error {
 	if m.db == nil {
 		return nil
 	}
-	var result sql.Result
 	var err error
 	if m.dbDialect == codexdb.DialectPostgres {
-		result, err = m.db.Exec(`DELETE FROM codex_accounts WHERE email=$1 OR account_id=$2`, acc.GetEmail(), acc.GetAccountID())
+		_, err = m.db.Exec(`DELETE FROM codex_accounts WHERE email=$1 OR account_id=$2`, acc.GetEmail(), acc.GetAccountID())
 	} else {
-		result, err = m.db.Exec(`DELETE FROM codex_accounts WHERE email=? OR account_id=?`, acc.GetEmail(), acc.GetAccountID())
+		_, err = m.db.Exec(`DELETE FROM codex_accounts WHERE email=? OR account_id=?`, acc.GetEmail(), acc.GetAccountID())
 	}
-	if err != nil {
-		return err
-	}
-	_, _ = result.RowsAffected()
-	return nil
+	return err
 }
 
 /**
@@ -985,20 +991,7 @@ func (m *Manager) Pick(model string) (*Account, error) {
 }
 
 /**
- * PickExcluding 选择下一个可用账号，排除已用过的账号
- * 用于错误重试时切换到不同的账号
- * @param model - 请求的模型名称
- * @param excluded - 已排除的账号文件路径集合
- * @returns *Account - 选中的账号
- * @returns error - 没有可用账号时返回错误
- */
-/**
- * PickExcluding 选择下一个可用账号，排除已用过的账号，优先选择活跃的账号
- * 策略：先排除失败账号 → 再过滤活跃状态 → 最后调用选择器
- * @param model - 请求的模型名称
- * @param excluded - 已排除的账号文件路径集合
- * @returns *Account - 选中的账号
- * @returns error - 没有可用账号时返回错误
+ * PickExcluding 选择下一个可用账号，排除已用过的账号；优先在活跃账号子集中选号，失败再回退全量排除列表。
  */
 func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Account, error) {
 	/* 原子指针读取，零锁 */
@@ -2062,11 +2055,15 @@ func mapRecover401FromRefreshOutcome(q QuotaApplyOutcome, email, fp string, refr
 	case QuotaApplyDisabled:
 		r.Status = Auth401RecoverDisabled
 		r.ReasonCode = ReasonAuth401Disabled
-	default:
+	case QuotaApplyCooldown:
 		r.Status = Auth401RecoverCooldown429OK
+	default: /* QuotaApplyNone：如 ctx 取消导致策略未落地，勿误报为 429 额度正常 */
+		r.Status = Auth401RecoverSkippedBusy
 	}
 	if refreshErr != nil {
 		r.Detail = refreshErr.Error()
+	} else if q == QuotaApplyNone {
+		r.Detail = "refresh_outcome_none"
 	}
 	return r
 }
@@ -2197,6 +2194,9 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 	if err == nil {
 		acc.UpdateToken(*td)
 		qcEff := m.effectiveQuotaAfterRefresh(qc)
+		if !m.quotaPrecheck {
+			qcEff = nil
+		}
 		if qcEff != nil && !m.afterRefreshValidateQuota(rctx, qcEff, acc) {
 			out.Status = Auth401RecoverRemoved
 			out.ReasonCode = ReasonQuotaInvalidAfterRefresh
@@ -2208,11 +2208,8 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 			log.Errorf("账号 [%s] 401 刷新成功但持久化失败: %v", acc.GetEmail(), err)
 			out.Detail = "persist error: " + err.Error()
 		}
-		m.enqueueSave(acc)
 		acc.SetActive()
-		if m.db != nil {
-			m.enqueueSave(acc)
-		}
+		m.enqueueSave(acc)
 		m.InvalidateSelectorCache()
 		log.Infof("账号 [%s] 401 后刷新成功，已恢复可用", acc.GetEmail())
 		out.Status = Auth401RecoverRefreshed
@@ -2222,6 +2219,9 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 	recovered, qOut := m.handleRefreshHTTPError(rctx, acc, email, err, false)
 	if recovered {
 		qcEff := m.effectiveQuotaAfterRefresh(qc)
+		if !m.quotaPrecheck {
+			qcEff = nil
+		}
 		if qcEff != nil && !m.afterRefreshValidateQuota(rctx, qcEff, acc) {
 			out.Status = Auth401RecoverRemoved
 			out.ReasonCode = ReasonQuotaInvalidAfterRefresh

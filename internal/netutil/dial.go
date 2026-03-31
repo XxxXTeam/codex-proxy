@@ -11,6 +11,37 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// WrapDialWithTCPNoDelay 包装 DialContext，在成功拨号后对底层 TCP 设置 SetNoDelay(true)，
+// 减轻 Nagle 与批量 ACK 对交互式/SSE 首包延迟的影响。
+func WrapDialWithTCPNoDelay(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	if dial == nil {
+		return nil
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		setTCPNoDelayChain(c)
+		return c, nil
+	}
+}
+
+func setTCPNoDelayChain(c net.Conn) {
+	for c != nil {
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			return
+		}
+		type netConnHolder interface{ NetConn() net.Conn }
+		if h, ok := c.(netConnHolder); ok {
+			c = h.NetConn()
+			continue
+		}
+		return
+	}
+}
+
 // NormalizeResolveAddress normalizes resolve target input and supports:
 // - host
 // - host:port

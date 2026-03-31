@@ -156,6 +156,10 @@ startup-async-load: true
 # 额度查询并发数（0 表示使用 refresh-concurrency）
 # quota-check-concurrency: 0
 
+# 选号后是否先查 wham/usage 再发上游。默认 false：直发 Codex，401 透明换号，异步只刷 OAuth；周期 refresh 仍会按策略刷新/校验。
+# 高并发压测若 QPS 低，勿开此项（易在选号阶段被额度 API 拖死）。
+# quota-precheck: false
+
 # 连接池保活 ping 间隔（秒）
 # keepalive-interval: 60
 
@@ -172,6 +176,15 @@ startup-async-load: true
 max-conns-per-host: 512
 max-idle-conns: 1024
 max-idle-conns-per-host: 512
+
+# 启动时按 CPU 与 refresh-concurrency 自动抬升过小的出站池（默认 true）。若需强制保留极低连接数可关闭：
+# upstream-pool-auto-scale: true
+# upstream-pool-max-cap: 2048
+# 出站等待响应头超时（秒），0=不限制；上游极慢时勿设过短
+# upstream-response-header-timeout-sec: 0
+# fasthttp 最大并发连接，0=库默认；海量长连接 SSE 时可设如 262144。
+# 若开启 upstream-pool-auto-scale，会按 listen-concurrency 抬升出站 max-conns-per-host（上限仍受 upstream-pool-max-cap 约束）。
+# listen-concurrency: 0
 
 # 是否启用出站 HTTP/2（关闭则强制 HTTP/1.1，多连接并行通常更稳）
 enable-http2: false

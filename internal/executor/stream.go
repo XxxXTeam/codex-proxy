@@ -140,7 +140,7 @@ func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, r
 			return nil, meta, serr
 		}
 
-		buf := make([]byte, 32768)
+		buf := make([]byte, httpBufferSize)
 		n, rerr := httpResp.Body.Read(buf)
 		if rerr != nil && rerr != io.EOF {
 			_ = httpResp.Body.Close()
@@ -308,7 +308,7 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 				if !firstChunkAt.IsZero() {
 					firstChunkDur = firstChunkAt.Sub(streamStart)
 				}
-				log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (canceled)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, time.Duration(0), time.Duration(0), time.Since(streamStart), chunkCount, time.Since(streamStart))
+				log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_open_first_read=%v pump_first_client_chunk=%v pump_to_completed=%v tail_after_completed=%v pump_elapsed=%v chunks=%d e2e_est=%v (canceled)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, time.Duration(0), time.Duration(0), time.Since(streamStart), chunkCount, s.SendDur+time.Since(streamStart))
 				/* 已向客户端承诺 SSE：无任何 data 时须返回错误，避免 200 + 空体 */
 				if chunkCount == 0 {
 					return fmt.Errorf("读取流式响应中断: %w", scanErr)
@@ -359,7 +359,8 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 			completedDur = completedAt.Sub(streamStart)
 			tailAfterCompleted = time.Since(completedAt)
 		}
-		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (ERR)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(streamStart))
+		pumpEl := time.Since(streamStart)
+		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_open_first_read=%v pump_first_client_chunk=%v pump_to_completed=%v tail_after_completed=%v pump_elapsed=%v chunks=%d e2e_est=%v (ERR)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, pumpEl, chunkCount, s.SendDur+pumpEl)
 		return wrapReadErr(scanErr)
 	}
 
@@ -375,7 +376,8 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 			completedDur = completedAt.Sub(streamStart)
 			tailAfterCompleted = time.Since(completedAt)
 		}
-		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (empty)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(streamStart))
+		pumpEl := time.Since(streamStart)
+		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_open_first_read=%v pump_first_client_chunk=%v pump_to_completed=%v tail_after_completed=%v pump_elapsed=%v chunks=%d e2e_est=%v (empty)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, pumpEl, chunkCount, s.SendDur+pumpEl)
 		diag := state.EmptyUpstreamDiag(pumpScanLines)
 		log.Warnf("chat stream 上游空响应: model=%s account=%s attempts=%d %s", s.BaseModel, s.account.GetEmail(), s.Attempts, diag)
 		return fmt.Errorf("%w: %s", ErrEmptyResponse, diag)
@@ -432,7 +434,8 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 		completedDur = completedAt.Sub(streamStart)
 		tailAfterCompleted = time.Since(completedAt)
 	}
-	log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v done_write=%v stream=%v chunks=%d total=%v", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, doneWriteDur, time.Since(streamStart), chunkCount, time.Since(streamStart))
+	pumpEl := time.Since(streamStart)
+	log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_open_first_read=%v pump_first_client_chunk=%v pump_to_completed=%v tail_after_completed=%v done_write=%v pump_elapsed=%v chunks=%d e2e_est=%v", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, doneWriteDur, pumpEl, chunkCount, s.SendDur+pumpEl)
 	return nil
 }
 

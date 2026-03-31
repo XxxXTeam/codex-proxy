@@ -66,6 +66,8 @@ type HTTPPoolConfig struct {
 	TLSHandshakeTimeoutSec int
 	/* HTTP2MaxConnsPerHostCap 覆盖 h2 下单主机连接数上限，0 使用 netutil 内置默认 */
 	HTTP2MaxConnsPerHostCap int
+	/* ResponseHeaderTimeoutSec 等待响应头超时（秒），0 不限制 */
+	ResponseHeaderTimeoutSec int
 }
 
 /**
@@ -108,6 +110,7 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		KeepAlive: 60 * time.Second,
 	}
 	dialCtx := netutil.BuildUpstreamDialContext(dialer, proxyURL, poolCfg.BackendDomain, poolCfg.ResolveAddress)
+	dialCtx = netutil.WrapDialWithTCPNoDelay(dialCtx)
 
 	idleSec := poolCfg.IdleConnTimeoutSec
 	if idleSec <= 0 {
@@ -116,6 +119,10 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 	var tlsHandshake time.Duration
 	if poolCfg.TLSHandshakeTimeoutSec > 0 {
 		tlsHandshake = time.Duration(poolCfg.TLSHandshakeTimeoutSec) * time.Second
+	}
+	var respHeader time.Duration
+	if poolCfg.ResponseHeaderTimeoutSec > 0 {
+		respHeader = time.Duration(poolCfg.ResponseHeaderTimeoutSec) * time.Second
 	}
 
 	transport := netutil.NewUpstreamTransport(netutil.UpstreamTransportConfig{
@@ -128,6 +135,7 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		EnableHTTP2:             enableHTTP2,
 		IdleConnTimeout:         time.Duration(idleSec) * time.Second,
 		TLSHandshakeTimeout:     tlsHandshake,
+		ResponseHeaderTimeout:   respHeader,
 		WriteBufferSize:         httpBufferSize,
 		ReadBufferSize:          httpBufferSize,
 		DisableCompression:      true,
@@ -348,10 +356,11 @@ func IsRetryableStatus(code int) bool {
  * @returns error - 所有重试均失败时返回错误
  */
 func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model string, apiURL string, codexBody []byte, stream bool) (*http.Response, *auth.Account, int, error) {
-	excluded := make(map[string]bool)
 	maxAttempts := rc.MaxRetry + 1
+	excluded := make(map[string]bool, maxAttempts+8)
 	var lastErr error
 
+	bodyReader := bytes.NewReader(codexBody)
 	trySend := func(account *auth.Account, attemptOneBased, maxLabel int, pickDur time.Duration) (*http.Response, error) {
 		startAttempt := time.Now()
 		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attemptOneBased, maxLabel, account.GetEmail(), model, stream)
@@ -366,7 +375,8 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			}
 
 			buildStart := time.Now()
-			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+			_, _ = bodyReader.Seek(0, io.SeekStart)
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bodyReader)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %w", errCodexBuildRequest, err)
 			}
@@ -795,6 +805,11 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 
 		_ = httpResp.Body.Close()
 		account.RecordFailure()
+		if round+1 < readRounds {
+			excluded[account.FilePath] = true
+			log.Warnf("responses-nonstream 未收到 response.completed，换号重试 (%d/%d) account=%s", round+1, readRounds, account.GetEmail())
+			continue
+		}
 		log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (no completed)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 		return nil, fmt.Errorf("未收到 response.completed 事件")
 	}
@@ -1039,6 +1054,13 @@ func handleAccountError(account *auth.Account, statusCode int, body []byte) {
 		}
 	case statusCode == 403:
 		account.SetCooldown(5 * time.Minute)
+	case statusCode == 502 || statusCode == 503 || statusCode == 504:
+		/* 网关/过载：短暂冷却，换号优先；若响应含 resets 等仍尊重 parseRetryAfter */
+		cd := parseRetryAfter(body)
+		if cd <= 0 || cd > 3*time.Minute {
+			cd = 30 * time.Second
+		}
+		account.SetCooldown(cd)
 	}
 }
 

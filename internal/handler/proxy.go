@@ -72,10 +72,14 @@ type ProxyHandler struct {
 	maxRetry             int
 	enableHealthyRetry   bool
 	quotaChecker         *auth.QuotaChecker
+	quotaPrecheck        bool /* true：选号后 wham 预检；false：直发上游，401 换号+异步 OAuth */
 	indexHTML            []byte
 	emptyRetryMax        int
 	debugUpstreamStream  bool     /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
 	auth401RecoverTracks sync.Map /* key: filePath, value: *auth401RecoverTrack */
+	/* retryCfg 在首请求时构建一次，避免每条对话重复分配闭包与 RetryConfig */
+	retryCfgOnce sync.Once
+	retryCfg     executor.RetryConfig
 }
 
 /* auth401RecoverTrack 追踪单个账号的 401 恢复情况 */
@@ -93,10 +97,11 @@ type auth401RecoverTrack struct {
  * @param quotaCheckConcurrency - 额度查询并发数（来自 config；quotaChecker 为 nil 新建 checker 时用）
  * @param quotaCheckCacheTTLSec - wham 预检本地复用秒数（quotaChecker 为 nil 时传给 NewQuotaChecker；0 关闭）
  * @param quotaChecker - 与 main 注入 Manager 的同一实例（wham/usage）；nil 时内部新建
+ * @param quotaPrecheck - true 时选号后 wham 预检；false 时直发上游（401 换号 + 异步 OAuth，见 quota-precheck 配置）
  * @param debugUpstreamStream - 是否 Info 打印上游 Codex SSE 原文（对应配置 debug-upstream-stream）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, emptyRetryMax int, debugUpstreamStream bool, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -113,6 +118,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		maxRetry:            maxRetry,
 		enableHealthyRetry:  enableHealthyRetry,
 		quotaChecker:        quotaChecker,
+		quotaPrecheck:       quotaPrecheck,
 		indexHTML:           indexHTML,
 		emptyRetryMax:       emptyRetryMax,
 		debugUpstreamStream: debugUpstreamStream,
@@ -302,11 +308,14 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
 }
 
 /**
- * buildRetryConfig 构建 executor 内部重试配置
- * 将 handler 的账号选择和 401 处理逻辑封装为回调传给 executor
- * @returns executor.RetryConfig - 重试配置
+ * buildRetryConfig 返回 executor 内部重试配置（进程内缓存，字段不变时勿改 handler 相关配置）
  */
 func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
+	h.retryCfgOnce.Do(func() { h.retryCfg = h.buildRetryConfigOnce() })
+	return h.retryCfg
+}
+
+func (h *ProxyHandler) buildRetryConfigOnce() executor.RetryConfig {
 	healthyPick := func(model string, excluded map[string]bool) (*auth.Account, error) {
 		return h.manager.PickRecentlySuccessful(model, excluded)
 	}
@@ -334,19 +343,20 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 			if statusCode >= 200 && statusCode < 300 {
 				return
 			}
-			/* 仅当 handleAccountError 会写入冷却等原子状态时失效缓存；401/5xx 等不改可用性，避免错误风暴下惊群 filterAvailable */
-			if statusCode == 429 || statusCode == 403 {
+			/* 冷却或限频后失效选号缓存；502/503/504 同步失效，避免大量请求继续撞同一批刚失败的号 */
+			if statusCode == 429 || statusCode == 403 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
 				h.manager.InvalidateSelectorCache()
 			}
 		},
-		QuotaCheckFn: func(ctx context.Context, acc *auth.Account) bool {
-			if h.quotaChecker == nil {
-				return true
-			}
+		MaxRetry:            h.maxRetry,
+		EmptyRetryMax:       h.emptyRetryMax,
+		DebugUpstreamStream: h.debugUpstreamStream,
+	}
+	if h.quotaPrecheck && h.quotaChecker != nil {
+		rc.QuotaCheckFn = func(ctx context.Context, acc *auth.Account) bool {
 			if acc != nil && !acc.HasRefreshToken() {
 				return true
 			}
-			/* verdict: 1=额度有效；0/2=暂态失败或 429，仍尝试上游；-1=明确无效，不重试浪费上游 */
 			verdict := h.quotaChecker.CheckAccountResult(ctx, acc)
 			switch verdict {
 			case 1:
@@ -363,10 +373,7 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 			default:
 				return true
 			}
-		},
-		MaxRetry:            h.maxRetry,
-		EmptyRetryMax:       h.emptyRetryMax,
-		DebugUpstreamStream: h.debugUpstreamStream,
+		}
 	}
 	if h.enableHealthyRetry {
 		rc.HealthyPickFn = healthyPick
@@ -475,6 +482,14 @@ func chatStreamPumpErrorMeta(execErr error) (message, typ string) {
  * @param err - executor 返回的错误
  */
 func handleExecutorError(ctx *fasthttp.RequestCtx, err error) {
+	if errors.Is(err, context.Canceled) {
+		sendError(ctx, fasthttp.StatusBadGateway, "请求已取消或客户端断开", "request_cancelled")
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		sendError(ctx, fasthttp.StatusGatewayTimeout, "请求处理超时", "timeout")
+		return
+	}
 	if errors.Is(err, executor.ErrEmptyResponse) {
 		sendError(ctx, fasthttp.StatusBadGateway, "上游未返回有效内容（空响应）", "bad_gateway")
 		return

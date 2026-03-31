@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
+
+	"codex-proxy/internal/netutil"
 
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -62,14 +65,20 @@ type Config struct {
 	/* HealthCheckReqTimeout 定时健康检查单次请求超时（秒），与对话转发无关 */
 	HealthCheckReqTimeout int `yaml:"health-check-request-timeout"`
 	/* DisabledRecoveryIntervalSec 仅磁盘凭据：周期性将 *.json.disabled 还原为 .json，OAuth+额度探测，失败则删文件；0 关闭。默认见 DefaultDisabledRecoveryIntervalSec */
-	DisabledRecoveryIntervalSec int  `yaml:"disabled-recovery-interval-sec"`
-	RefreshConcurrency          int  `yaml:"refresh-concurrency"`
-	MaxConnsPerHost             int  `yaml:"max-conns-per-host"`
-	MaxIdleConns                int  `yaml:"max-idle-conns"`
-	MaxIdleConnsPerHost         int  `yaml:"max-idle-conns-per-host"`
-	EnableHTTP2                 bool `yaml:"enable-http2"`
-	StartupAsyncLoad            bool `yaml:"startup-async-load"`
-	StartupLoadRetryInterval    int  `yaml:"startup-load-retry-interval"`
+	DisabledRecoveryIntervalSec int `yaml:"disabled-recovery-interval-sec"`
+	RefreshConcurrency          int `yaml:"refresh-concurrency"`
+	MaxConnsPerHost             int `yaml:"max-conns-per-host"`
+	MaxIdleConns                int `yaml:"max-idle-conns"`
+	MaxIdleConnsPerHost         int `yaml:"max-idle-conns-per-host"`
+	/* UpstreamPoolAutoScale 启动时按 CPU 核数与 refresh-concurrency 抬升过小的出站池，减轻高并发下排队等连接 */
+	UpstreamPoolAutoScale bool `yaml:"upstream-pool-auto-scale"`
+	/* UpstreamPoolMaxCap 自适应时单主机并发连接上限，0 表示 2048 */
+	UpstreamPoolMaxCap int `yaml:"upstream-pool-max-cap"`
+	/* UpstreamResponseHeaderTimeoutSec 出站等待响应头超时（秒），0 不限制；可兜住半开连接，长排队模型慎用过短 */
+	UpstreamResponseHeaderTimeoutSec int  `yaml:"upstream-response-header-timeout-sec"`
+	EnableHTTP2                      bool `yaml:"enable-http2"`
+	StartupAsyncLoad                 bool `yaml:"startup-async-load"`
+	StartupLoadRetryInterval         int  `yaml:"startup-load-retry-interval"`
 	/* StartupLoadBatchSize startup-async-load：磁盘 JSON 每批解析文件数，或 db-enabled 时每批从库读取行数；0 表示内置默认（8000） */
 	StartupLoadBatchSize int `yaml:"startup-load-batch-size"`
 	ShutdownTimeout      int `yaml:"shutdown-timeout"`
@@ -91,19 +100,21 @@ type Config struct {
 	RefreshHTTPStatusPolicy map[string]map[string]string `yaml:"refresh-http-status-policy"`
 	QuotaHTTPStatusPolicy   map[string]map[string]string `yaml:"quota-http-status-policy"`
 	QuotaCheckConcurrency   int                          `yaml:"quota-check-concurrency"`
-	QuotaCheckCacheTTLSec int `yaml:"quota-check-cache-ttl-sec"`
+	QuotaCheckCacheTTLSec   int                          `yaml:"quota-check-cache-ttl-sec"`
+	/* QuotaPrecheck 为 true 时，选号后先调 wham/usage 再发上游；默认 false 直接发上游，401 换号、异步 OAuth，由周期刷新与策略处置额度 */
+	QuotaPrecheck bool `yaml:"quota-precheck"`
 	/* UpstreamIdleConnTimeoutSec 出站 Codex 连接池空闲超时（秒），0 表示使用内置默认 120 */
 	UpstreamIdleConnTimeoutSec int `yaml:"upstream-idle-conn-timeout-sec"`
 	/* UpstreamTLSHandshakeTimeoutSec 出站 TLS 握手超时（秒），0 不额外限制 */
 	UpstreamTLSHandshakeTimeoutSec int `yaml:"upstream-tls-handshake-timeout-sec"`
 	/* HTTP2MaxConnsPerHostCap 开启 enable-http2 时单主机 TCP 连接上限，0 使用内置 30 */
-	HTTP2MaxConnsPerHostCap int `yaml:"http2-max-conns-per-host-cap"`
-	KeepaliveInterval       int `yaml:"keepalive-interval"`
-	EmptyRetryMax    int      `yaml:"empty-retry-max"`
-	Selector         string   `yaml:"selector"`
-	RefreshBatchSize int      `yaml:"refresh-batch-size"`
-	Accounts         []string `yaml:"accounts"`
-	APIKeys          []string `yaml:"api-keys"`
+	HTTP2MaxConnsPerHostCap int      `yaml:"http2-max-conns-per-host-cap"`
+	KeepaliveInterval       int      `yaml:"keepalive-interval"`
+	EmptyRetryMax           int      `yaml:"empty-retry-max"`
+	Selector                string   `yaml:"selector"`
+	RefreshBatchSize        int      `yaml:"refresh-batch-size"`
+	Accounts                []string `yaml:"accounts"`
+	APIKeys                 []string `yaml:"api-keys"`
 
 	/* 入站 HTTP/2 (h2c) 等 */
 	EnableListenH2C            bool `yaml:"enable-listen-h2c"`
@@ -112,6 +123,8 @@ type Config struct {
 	ListenTCPKeepaliveSec      int  `yaml:"listen-tcp-keepalive-sec"`
 	ListenMaxHeaderBytes       int  `yaml:"listen-max-header-bytes"`
 	H2MaxConcurrentStreams     int  `yaml:"h2-max-concurrent-streams"`
+	/* ListenConcurrency fasthttp 最大并发连接，0 为库默认；大量长连接 SSE 时可显式提高 */
+	ListenConcurrency int `yaml:"listen-concurrency"`
 }
 
 /**
@@ -127,58 +140,61 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Listen:                         ":8080",
-		AuthDir:                        "./auths",
-		DBEnabled:                      false,
-		DBDriver:                       "postgres",
-		DBHost:                         "127.0.0.1",
-		DBPort:                         5432,
-		DBUser:                         "",
-		DBPassword:                     "",
-		DBName:                         "codex_proxy",
-		DBSSLMode:                      "disable",
-		DBDSN:                          "",
-		BackendDomain:                  "",
-		BaseURL:                        "",
-		LogLevel:                       "info",
-		RefreshInterval:                3000,
-		MaxRetry:                       2,
-		EnableHealthyRetry:             true,
-		HealthCheckInterval:            300,
-		HealthCheckMaxFailures:         3,
-		HealthCheckConcurrency:         5,
-		HealthCheckStartDelay:          45,
-		HealthCheckBatchSize:           20,
-		HealthCheckReqTimeout:          8,
-		DisabledRecoveryIntervalSec:    DefaultDisabledRecoveryIntervalSec,
-		RefreshConcurrency:             50,
-		MaxConnsPerHost:                12, /* 配合 HTTP/2 降低 GOAWAY ENHANCE_YOUR_CALM 概率 */
-		MaxIdleConns:                   48,
-		MaxIdleConnsPerHost:            8,
-		EnableHTTP2:                    false, /* 默认 HTTP/1.1，多连接复用更稳；需 h2 可显式开启 */
-		StartupAsyncLoad:               true,
-		StartupLoadRetryInterval:       10,
-		ShutdownTimeout:                5,
-		AuthScanInterval:               30,
-		SaveWorkers:                    4,
-		Cooldown401Sec:                 30,
-		Cooldown429Sec:                 60,
-		RefreshSingleTimeoutSec:        30,
-		QuotaCheckConcurrency:          0, /* 0 表示使用 refresh-concurrency */
-		QuotaCheckCacheTTLSec:          30,
-		UpstreamIdleConnTimeoutSec:     0,
-		UpstreamTLSHandshakeTimeoutSec: 0,
-		HTTP2MaxConnsPerHostCap:        0,
-		KeepaliveInterval:              60,
-		EmptyRetryMax:                  2,
-		Selector:                       "round-robin",
-		RefreshBatchSize:               0,
-		EnableListenH2C:                true,
-		ListenReadHeaderTimeoutSec:     60,
-		ListenIdleTimeoutSec:           180,
-		ListenTCPKeepaliveSec:          30,
-		ListenMaxHeaderBytes:           1 << 20,
-		H2MaxConcurrentStreams:         1000,
+		Listen:                           ":8080",
+		AuthDir:                          "./auths",
+		DBEnabled:                        false,
+		DBDriver:                         "postgres",
+		DBHost:                           "127.0.0.1",
+		DBPort:                           5432,
+		DBUser:                           "",
+		DBPassword:                       "",
+		DBName:                           "codex_proxy",
+		DBSSLMode:                        "disable",
+		DBDSN:                            "",
+		BackendDomain:                    "",
+		BaseURL:                          "",
+		LogLevel:                         "info",
+		RefreshInterval:                  3000,
+		MaxRetry:                         2,
+		EnableHealthyRetry:               true,
+		HealthCheckInterval:              300,
+		HealthCheckMaxFailures:           3,
+		HealthCheckConcurrency:           5,
+		HealthCheckStartDelay:            45,
+		HealthCheckBatchSize:             20,
+		HealthCheckReqTimeout:            8,
+		DisabledRecoveryIntervalSec:      DefaultDisabledRecoveryIntervalSec,
+		RefreshConcurrency:               50,
+		MaxConnsPerHost:                  12,
+		MaxIdleConns:                     48,
+		MaxIdleConnsPerHost:              8,
+		UpstreamPoolAutoScale:            true,
+		UpstreamPoolMaxCap:               0,
+		UpstreamResponseHeaderTimeoutSec: 0,
+		EnableHTTP2:                      false,
+		StartupAsyncLoad:                 true,
+		StartupLoadRetryInterval:         10,
+		ShutdownTimeout:                  5,
+		AuthScanInterval:                 30,
+		SaveWorkers:                      4,
+		Cooldown401Sec:                   30,
+		Cooldown429Sec:                   60,
+		RefreshSingleTimeoutSec:          30,
+		QuotaCheckConcurrency:            0, /* 0 表示使用 refresh-concurrency */
+		QuotaCheckCacheTTLSec:            30,
+		UpstreamIdleConnTimeoutSec:       0,
+		UpstreamTLSHandshakeTimeoutSec:   0,
+		HTTP2MaxConnsPerHostCap:          0,
+		KeepaliveInterval:                60,
+		EmptyRetryMax:                    2,
+		Selector:                         "round-robin",
+		RefreshBatchSize:                 0,
+		EnableListenH2C:                  true,
+		ListenReadHeaderTimeoutSec:       60,
+		ListenIdleTimeoutSec:             180,
+		ListenTCPKeepaliveSec:            30,
+		ListenMaxHeaderBytes:             1 << 20,
+		H2MaxConcurrentStreams:           1000,
 	}
 
 	if err = yaml.Unmarshal(data, cfg); err != nil {
@@ -432,6 +448,26 @@ func (c *Config) Sanitize() {
 	if c.H2MaxConcurrentStreams > 10000 {
 		c.H2MaxConcurrentStreams = 10000
 	}
+	if c.ListenConcurrency < 0 {
+		c.ListenConcurrency = 0
+	}
+	if c.ListenConcurrency > 10_000_000 {
+		c.ListenConcurrency = 10_000_000
+	}
+	if c.UpstreamPoolMaxCap < 0 {
+		c.UpstreamPoolMaxCap = 0
+	}
+	if c.UpstreamPoolMaxCap > 8192 {
+		c.UpstreamPoolMaxCap = 8192
+	}
+	if c.UpstreamResponseHeaderTimeoutSec < 0 {
+		c.UpstreamResponseHeaderTimeoutSec = 0
+	}
+	if c.UpstreamResponseHeaderTimeoutSec > 3600 {
+		c.UpstreamResponseHeaderTimeoutSec = 3600
+	}
+
+	applyUpstreamPoolAutoscale(c)
 
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":
@@ -450,6 +486,67 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("proxy-url 配置无效: %w", err)
 	}
 	return nil
+}
+
+/* applyUpstreamPoolAutoscale 按机器与 refresh-concurrency 抬升过小的出站池，避免 HTTP/1.1 下大量流式请求共抢少量 TCP。开启 enable-http2 时目标受 h2 单主机连接上限约束。 */
+func applyUpstreamPoolAutoscale(c *Config) {
+	if c == nil || !c.UpstreamPoolAutoScale {
+		return
+	}
+	procs := runtime.GOMAXPROCS(0)
+	if procs < 1 {
+		procs = 1
+	}
+	refresh := c.RefreshConcurrency
+	if refresh < 1 {
+		refresh = 50
+	}
+	capMax := 2048
+	if c.UpstreamPoolMaxCap > 0 {
+		capMax = c.UpstreamPoolMaxCap
+	}
+	target := refresh * 2
+	if p := procs * 32; p > target {
+		target = p
+	}
+	if target < 128 {
+		target = 128
+	}
+	/* 入站若显式并发上限，出站 TCP 至少对齐（长连接 SSE ≈ 每客户端一路上游） */
+	if c.ListenConcurrency > 0 {
+		lc := c.ListenConcurrency
+		if lc > capMax {
+			lc = capMax
+		}
+		if lc > target {
+			target = lc
+		}
+	}
+	if target > capMax {
+		target = capMax
+	}
+	if c.EnableHTTP2 {
+		h2lim := netutil.MaxConnsPerHostHTTP2Cap
+		if c.HTTP2MaxConnsPerHostCap > 0 {
+			h2lim = c.HTTP2MaxConnsPerHostCap
+		}
+		if target > h2lim {
+			target = h2lim
+		}
+	}
+	if c.MaxConnsPerHost < target {
+		c.MaxConnsPerHost = target
+	}
+	if c.MaxIdleConnsPerHost < c.MaxConnsPerHost {
+		c.MaxIdleConnsPerHost = c.MaxConnsPerHost
+	}
+	minIdle := c.MaxIdleConnsPerHost * 2
+	if minIdle < c.MaxIdleConnsPerHost {
+		minIdle = c.MaxIdleConnsPerHost
+	}
+	if c.MaxIdleConns < minIdle {
+		c.MaxIdleConns = minIdle
+	}
 }
 
 func validateProxyURL(proxyURL string) error {
