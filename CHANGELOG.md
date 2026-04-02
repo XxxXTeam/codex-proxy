@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.5.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.4.0...v1.5.0) (2026-04-02)
+
+
+### ✨ 新功能
+
+* **proxy:** 添加 /v1/responses/compact 路由和测试 ([e997591](https://github.com/XxxXTeam/codex-proxy/commit/e997591e76cd28ace393394964c2f6c7ae42864f))
+
+
+### 🐛 错误修复
+
+* 删除测试文件 ([bea00da](https://github.com/XxxXTeam/codex-proxy/commit/bea00da3a567691a8313487901350bab084ae3c7))
+
 ## [1.4.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.3.0...v1.4.0) (2026-03-31)
 
 
