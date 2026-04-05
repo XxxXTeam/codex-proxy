@@ -91,7 +91,7 @@ jobs:
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: zip-*
           merge-multiple: true
