@@ -7,7 +7,7 @@ require (
 	github.com/fasthttp/websocket v1.5.12
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/google/uuid v1.6.0
-	github.com/lib/pq v1.12.0
+	github.com/lib/pq v1.12.3
 	github.com/sirupsen/logrus v1.9.4
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
