@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.5.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.5.0...v1.5.1) (2026-04-06)
+
+
+### 📦 依赖更新
+
+* **ci:** bump actions/download-artifact from 4 to 8 ([#23](https://github.com/XxxXTeam/codex-proxy/issues/23)) ([37ed431](https://github.com/XxxXTeam/codex-proxy/commit/37ed43151b998b035991412f681c1d5b88b2839a))
+* **ci:** bump actions/upload-artifact from 4 to 7 ([#24](https://github.com/XxxXTeam/codex-proxy/issues/24)) ([eda64e7](https://github.com/XxxXTeam/codex-proxy/commit/eda64e7c14f277700c892715bb24eea796498c74))
+* **go:** bump github.com/lib/pq from 1.12.0 to 1.12.3 ([#22](https://github.com/XxxXTeam/codex-proxy/issues/22)) ([25e876e](https://github.com/XxxXTeam/codex-proxy/commit/25e876e30f94a63d79d5a97bc089296130dd6850))
+* **go:** bump modernc.org/sqlite from 1.48.0 to 1.48.1 ([#21](https://github.com/XxxXTeam/codex-proxy/issues/21)) ([a86e8ef](https://github.com/XxxXTeam/codex-proxy/commit/a86e8eff0eebf5a50e9fbe68dd19997f983f31c2))
+
 ## [1.5.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.4.0...v1.5.0) (2026-04-02)
 
 
