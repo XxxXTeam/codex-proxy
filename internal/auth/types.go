@@ -351,6 +351,29 @@ func (a *Account) UpdateToken(td TokenData) {
 }
 
 /**
+ * IsTokenExpiringSoon 检查 access_token 是否即将过期（5 分钟内）或已过期
+ * 用于发送请求前主动触发刷新，避免发送过期 token 到上游产生 401/429
+ * @returns bool - 如果 token 即将过期或已过期返回 true
+ */
+func (a *Account) IsTokenExpiringSoon() bool {
+	expMs := a.accessExpireUnixMs.Load()
+	if expMs == 0 {
+		/* 未知过期时间，检查 Token.Expire 字符串 */
+		a.mu.RLock()
+		expire := a.Token.Expire
+		a.mu.RUnlock()
+		if expire == "" {
+			return false /* 无过期信息，不阻止 */
+		}
+		if t, err := time.Parse(time.RFC3339, expire); err == nil {
+			return time.Until(t) < 5*time.Minute
+		}
+		return false
+	}
+	return time.Now().UnixMilli() >= expMs-int64(5*60*1000)
+}
+
+/**
  * SyncAccessExpireFromToken 根据当前 Token.Expire 刷新 accessExpireUnixMs（加载账号后调用）
  */
 func (a *Account) SyncAccessExpireFromToken() {

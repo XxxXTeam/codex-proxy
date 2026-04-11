@@ -58,6 +58,8 @@ type ManagerOptions struct {
 	DBDialect codexdb.Dialect
 	/* QuotaPrecheck 为 true 时，401 恢复路径在 OAuth 成功后仍跑 wham/usage；false 时仅刷新 Token，交周期刷新/上游错误处置 */
 	QuotaPrecheck bool
+	/* DisableAuth401Remove true 时 401 刷新失败只冷却不删号/禁用，保留账号等周期刷新再尝试 */
+	DisableAuth401Remove bool
 }
 
 /**
@@ -105,6 +107,8 @@ type Manager struct {
 	postRefreshQuota atomic.Pointer[QuotaChecker]
 	/* quotaPrecheck 见 ManagerOptions.QuotaPrecheck；false 时 recoverAuth401Once 不在刷新后查 wham */
 	quotaPrecheck bool
+	/* disableAuth401Remove true 时 401 刷新失败不删号/不禁用，只冷却 */
+	disableAuth401Remove bool
 }
 
 /**
@@ -161,6 +165,7 @@ func NewManager(authDir string, db *sql.DB, proxyURL string, refreshInterval int
 			m.auth401SyncSem = make(chan struct{}, opts.Auth401SyncRefreshConcurrency)
 		}
 		m.quotaPrecheck = opts.QuotaPrecheck
+		m.disableAuth401Remove = opts.DisableAuth401Remove
 	}
 	m.refreshHTTPPolicy = mergeRefreshHTTPPolicies(opts)
 	m.quotaHTTPPolicy = mergeQuotaHTTPPolicies(opts)
@@ -211,6 +216,52 @@ func (m *Manager) waitAccountRefreshIdle(ctx context.Context, acc *Account) bool
 			}
 		}
 	}
+}
+
+/**
+ * EnsureTokenFresh 发送上游请求前调用：若账号 access_token 即将过期则尝试内联刷新。
+ * 其他 goroutine 已在刷新时等待其完成；刷新失败时不阻止请求（由上游 401 触发换号）。
+ * 返回 true 表示 token 已可用（无论是否刷新过），false 表示账号已经不可用。
+ */
+func (m *Manager) EnsureTokenFresh(ctx context.Context, acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	if !acc.IsTokenExpiringSoon() {
+		return true
+	}
+	if !acc.HasRefreshToken() {
+		return true /* 无 refresh_token，交上游 401 换号 */
+	}
+
+	/* CAS 抢占刷新权 */
+	if !acc.refreshing.CompareAndSwap(0, 1) {
+		/* 他处已在刷新，短等待完成 */
+		m.waitAccountRefreshIdle(ctx, acc)
+		return acc.IsAvailable()
+	}
+	defer acc.refreshing.Store(0)
+
+	acc.mu.RLock()
+	rt := acc.Token.RefreshToken
+	email := acc.Token.Email
+	acc.mu.RUnlock()
+
+	log.Debugf("账号 [%s] token 即将过期，内联刷新…", email)
+
+	rctx, rcancel := m.refreshRequestContext(ctx)
+	defer rcancel()
+	td, err := m.refresher.RefreshTokenWithRetry(rctx, rt, 2)
+	if err != nil {
+		log.Warnf("账号 [%s] 内联刷新失败: %v，仍尝试上游请求", email, err)
+		return true /* 不阻止，让上游 401 触发换号 */
+	}
+
+	acc.UpdateToken(*td)
+	m.enqueueSave(acc)
+	m.InvalidateSelectorCache()
+	log.Infof("账号 [%s] 内联刷新成功", acc.GetEmail())
+	return true
 }
 
 func (m *Manager) prepareDBStatements() error {
@@ -1089,6 +1140,30 @@ func betterRecentSuccess(ms int64, fp string, bestMs int64, best *Account) bool 
 }
 
 /**
+ * PickIgnoringCooldown 选号时忽略冷却状态，仅排除 Disabled 与 excluded 列表。
+ * 用于 429 并发重试场景：所有账号可能均处于冷却，仍尝试发送。
+ */
+func (m *Manager) PickIgnoringCooldown(model string, excluded map[string]bool) (*Account, error) {
+	allAccounts := *m.accountsPtr.Load()
+	var candidates []*Account
+	for _, acc := range allAccounts {
+		if excluded[acc.FilePath] {
+			continue
+		}
+		st := AccountStatus(acc.atomicStatus.Load())
+		if st == StatusDisabled {
+			continue
+		}
+		candidates = append(candidates, acc)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("没有可用账号（忽略冷却）")
+	}
+	/* 轮询选取，简单取第一个候选 */
+	return candidates[0], nil
+}
+
+/**
  * GetAccounts 获取所有账号的只读快照
  * @returns []*Account - 账号列表
  */
@@ -1403,6 +1478,10 @@ func (m *Manager) handleRefreshHTTPError(ctx context.Context, acc *Account, emai
 	status, ok := RefreshHTTPStatusFromErr(err)
 	if !ok {
 		log.Warnf("账号 [%s] 刷新失败: %v", email, err)
+		if m.disableAuth401Remove {
+			log.Warnf("账号 [%s] 已配置不删号/不冷却，保留原状态", email)
+			return false, QuotaApplyCooldown
+		}
 		if noPolicyRemove {
 			m.RemoveAccount(acc, ReasonRefreshFailed)
 			return false, QuotaApplyRemoved
@@ -1412,6 +1491,10 @@ func (m *Manager) handleRefreshHTTPError(ctx context.Context, acc *Account, emai
 	}
 	pol, has := m.refreshHTTPPolicy[status]
 	if !has {
+		if m.disableAuth401Remove {
+			log.Warnf("账号 [%s] 刷新 HTTP %d 无策略，已配置不删号/不冷却，保留原状态", email, status)
+			return false, QuotaApplyCooldown
+		}
 		if noPolicyRemove {
 			log.Warnf("账号 [%s] 刷新 HTTP %d 无策略，移除", email, status)
 			m.RemoveAccount(acc, ReasonRefreshFailed)
@@ -2167,6 +2250,12 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 	acc.mu.RUnlock()
 
 	if refreshToken == "" {
+		if m.disableAuth401Remove {
+			log.Warnf("账号 [%s] 无 refresh_token，已配置不删号/不冷却，保留原状态", email)
+			out.Status = Auth401RecoverSkippedBusy
+			out.Detail = "missing refresh_token, kept (disable-auth-401-remove)"
+			return out
+		}
 		log.Warnf("账号 [%s] 无 refresh_token（空或 null），401 触发已从号池删除", email)
 		m.RemoveAccount(acc, ReasonAuth401NoRefreshToken)
 		out.Status = Auth401RecoverRemoved
@@ -2289,7 +2378,7 @@ func (m *Manager) HandleAuth401(acc *Account, qc *QuotaChecker) Auth401RecoverRe
 }
 
 /**
- * ScheduleUpstream429Recovery 上游 429 后异步：先查额度，未通过则等待 1 小时、刷新 token 再查，仍失败则删号
+ * ScheduleUpstream429Recovery 上游 429 后异步恢复：先立即查额度，未通过则指数退避重试（2m→5m→10m），每轮先刷新 token 再查额度
  */
 func (m *Manager) ScheduleUpstream429Recovery(_ context.Context, acc *Account, qc *QuotaChecker) {
 	if qc == nil || acc == nil {
@@ -2305,6 +2394,7 @@ func (m *Manager) ScheduleUpstream429Recovery(_ context.Context, acc *Account, q
 		defer acc.upstream429Recovering.Store(0)
 		email := acc.GetEmail()
 
+		/* 立即查一次额度 */
 		qctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		v1, st1 := qc.CheckAccountResultWithStatus(qctx, acc)
 		cancel()
@@ -2319,62 +2409,78 @@ func (m *Manager) ScheduleUpstream429Recovery(_ context.Context, acc *Account, q
 			return
 		}
 
-		log.Warnf("账号 [%s] 上游 429 后额度查询暂态失败，1 小时后刷新凭证并重试", email)
+		/* 指数退避重试：2min, 5min, 10min（取代原来的 1 小时固定等待） */
+		backoffs := []time.Duration{2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
+		for round, wait := range backoffs {
+			log.Warnf("账号 [%s] 上游 429 恢复：第 %d 轮等待 %v 后刷新凭证并重试", email, round+1, wait)
 
-		select {
-		case <-time.After(1 * time.Hour):
-		case <-m.stopCh:
-			return
-		}
-
-		if !m.AccountInPool(acc) {
-			return
-		}
-
-		if acc.refreshing.CompareAndSwap(0, 1) {
-			func() {
-				defer acc.refreshing.Store(0)
-				acc.mu.RLock()
-				rt := acc.Token.RefreshToken
-				acc.mu.RUnlock()
-				if rt == "" {
-					m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
-					return
-				}
-				rctx, rcancel := m.refreshRequestContext(context.Background())
-				defer rcancel()
-				td, err := m.refresher.RefreshTokenWithRetry(rctx, rt, 3)
-				if err != nil {
-					_, _ = m.handleRefreshHTTPError(rctx, acc, acc.GetEmail(), err, true)
-					return
-				}
-				acc.UpdateToken(*td)
-				if err := m.saveTokenToFile(acc); err != nil {
-					log.Errorf("账号 [%s] 429 恢复刷新后持久化失败: %v", acc.GetEmail(), err)
-				}
-				m.enqueueSave(acc)
-			}()
-		} else {
-			log.Debugf("账号 [%s] 429 恢复：跳过刷新（他处正在刷新）", email)
-		}
-
-		if !m.AccountInPool(acc) {
-			return
-		}
-
-		qctx2, cancel2 := context.WithTimeout(context.Background(), 25*time.Second)
-		v2, st2 := qc.CheckAccountResultWithStatus(qctx2, acc)
-		cancel2()
-		if v2 == 1 {
-			acc.SetActive()
-			if m.db != nil {
-				m.enqueueSave(acc)
+			select {
+			case <-time.After(wait):
+			case <-m.stopCh:
+				return
 			}
-			m.InvalidateSelectorCache()
-			log.Infof("账号 [%s] 429 恢复：额度查询已通过，已恢复可用", acc.GetEmail())
-			return
+
+			if !m.AccountInPool(acc) {
+				return
+			}
+
+			/* 刷新 token */
+			if acc.refreshing.CompareAndSwap(0, 1) {
+				func() {
+					defer acc.refreshing.Store(0)
+					acc.mu.RLock()
+					rt := acc.Token.RefreshToken
+					acc.mu.RUnlock()
+					if rt == "" {
+						m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
+						return
+					}
+					rctx, rcancel := m.refreshRequestContext(context.Background())
+					defer rcancel()
+					td, err := m.refresher.RefreshTokenWithRetry(rctx, rt, 3)
+					if err != nil {
+						_, _ = m.handleRefreshHTTPError(rctx, acc, acc.GetEmail(), err, true)
+						return
+					}
+					acc.UpdateToken(*td)
+					if err := m.saveTokenToFile(acc); err != nil {
+						log.Errorf("账号 [%s] 429 恢复刷新后持久化失败: %v", acc.GetEmail(), err)
+					}
+					m.enqueueSave(acc)
+				}()
+			} else {
+				log.Debugf("账号 [%s] 429 恢复：跳过刷新（他处正在刷新）", email)
+			}
+
+			if !m.AccountInPool(acc) {
+				return
+			}
+
+			/* 查额度 */
+			qctx2, cancel2 := context.WithTimeout(context.Background(), 25*time.Second)
+			v2, st2 := qc.CheckAccountResultWithStatus(qctx2, acc)
+			cancel2()
+			if v2 == 1 {
+				acc.SetActive()
+				if m.db != nil {
+					m.enqueueSave(acc)
+				}
+				m.InvalidateSelectorCache()
+				log.Infof("账号 [%s] 429 恢复（第 %d 轮）：额度查询已通过，已恢复可用", acc.GetEmail(), round+1)
+				return
+			}
+			if v2 != 0 {
+				/* 非暂态失败（4xx 等），按策略处理后不再重试 */
+				m.ApplyQuotaUsageHTTPOutcome(context.Background(), qc, acc, st2, v2)
+				return
+			}
 		}
-		m.ApplyQuotaUsageHTTPOutcome(context.Background(), qc, acc, st2, v2)
+		/* 所有退避轮次耗尽 */
+		log.Warnf("账号 [%s] 429 恢复：%d 轮退避后仍无法恢复", email, len(backoffs))
+		qctxF, cancelF := context.WithTimeout(context.Background(), 25*time.Second)
+		vF, stF := qc.CheckAccountResultWithStatus(qctxF, acc)
+		cancelF()
+		m.ApplyQuotaUsageHTTPOutcome(context.Background(), qc, acc, stF, vF)
 	}()
 }
 

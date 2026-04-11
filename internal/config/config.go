@@ -120,6 +120,18 @@ type Config struct {
 	/* EnableModelSuffix1M 控制是否允许模型名中的 -1m 子参数，并同步影响 /v1/models 枚举 */
 	EnableModelSuffix1M bool `yaml:"enable-model-suffix-1m"`
 
+	/* EnableWebSocket 控制 /v1/responses 是否接受 WebSocket 升级；false 时所有请求走 HTTP SSE */
+	EnableWebSocket bool `yaml:"enable-websocket"`
+	/* DisableAuth401Remove true 时 401 刷新失败只冷却不删号/禁用，保留账号等周期刷新再尝试 */
+	DisableAuth401Remove bool `yaml:"disable-auth-401-remove"`
+	/* DebugWSStream 为 true 时 WS 转发每帧都打 Debug 日志，排障时短期开启 */
+	DebugWSStream bool `yaml:"debug-ws-stream"`
+
+	/* Enable429ConcurrentRetry 显式开启：遇到 429 时并发用多个账号同时重试，首个成功响应返回客户端 */
+	Enable429ConcurrentRetry bool `yaml:"enable-429-concurrent-retry"`
+	/* ConcurrentRetry429TimeoutSec 并发重试最大等待时间（秒），0 表示默认 30 秒 */
+	ConcurrentRetry429TimeoutSec int `yaml:"concurrent-retry-429-timeout-sec"`
+
 	/* 入站 HTTP/2 (h2c) 等 */
 	EnableListenH2C            bool `yaml:"enable-listen-h2c"`
 	ListenReadHeaderTimeoutSec int  `yaml:"listen-read-header-timeout-sec"`
@@ -195,6 +207,7 @@ func LoadConfig(path string) (*Config, error) {
 		RefreshBatchSize:                 0,
 		EnableModelSuffixFast:            true,
 		EnableModelSuffix1M:              true,
+		EnableWebSocket:                  true,
 		EnableListenH2C:                  true,
 		ListenReadHeaderTimeoutSec:       60,
 		ListenIdleTimeoutSec:             180,

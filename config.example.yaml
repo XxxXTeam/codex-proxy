@@ -170,6 +170,20 @@ startup-async-load: true
 # enable-model-suffix-fast: true
 # enable-model-suffix-1m: true
 
+# /v1/responses 是否接受 WebSocket 升级（true 时 WS 客户端自动升级；false 则全部走 HTTP SSE）
+# enable-websocket: true
+
+# 401 刷新失败后：true 时只冷却保留账号（等周期刷新再尝试）；false 时删号/禁用（默认行为）
+# disable-auth-401-remove: false
+
+# WS 转发调试：每帧都打 Debug 日志（排障时短期开启，日志量大）
+# debug-ws-stream: false
+
+# 429 并发重试：遇 429 时同时用多个账号并发请求，首个成功即返回（默认关闭，需显式开启）
+# enable-429-concurrent-retry: false
+# 并发重试最大等待时间（秒），0 表示默认 30 秒
+# concurrent-retry-429-timeout-sec: 30
+
 # 空返回时最多再重试次数
 # empty-retry-max: 2
 

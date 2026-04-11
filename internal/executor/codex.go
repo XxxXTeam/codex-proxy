@@ -32,8 +32,9 @@ import (
 
 /* Codex 客户端版本常量，用于请求头 */
 const (
-	codexClientVersion = "0.101.0"
-	codexUserAgent     = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	codexClientVersion = "0.118.0"
+	codexUserAgent     = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
+	codexOriginator    = "codex-tui"
 )
 
 /* 预分配 SSE 输出字节片段，避免每次事件的内存分配 */
@@ -189,6 +190,13 @@ type RetryConfig struct {
 	EmptyRetryMax int
 	/* DebugUpstreamStream 为 true 时 Pump* 将上游 SSE 原始字节打到日志（见 stream.go） */
 	DebugUpstreamStream bool
+	/* EnsureTokenFreshFn 选号后、发送上游前检查 token 是否即将过期，若是则内联刷新；返回 false 表示账号不可用应换号 */
+	EnsureTokenFreshFn func(ctx context.Context, acc *auth.Account) bool
+	/* ConcurrentRetry429 显式开启：遇 429 时并发用多个账号同时重试，首个成功响应返回 */
+	ConcurrentRetry429        bool
+	ConcurrentRetry429Timeout time.Duration
+	/* PickIgnoringCooldownFn 忽略冷却状态的选号函数，用于并发重试时取回冷却中的账号 */
+	PickIgnoringCooldownFn func(model string, excluded map[string]bool) (*auth.Account, error)
 }
 
 /**
@@ -359,6 +367,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 	maxAttempts := rc.MaxRetry + 1
 	excluded := make(map[string]bool, maxAttempts+8)
 	var lastErr error
+	var last429 bool /* 最近一次失败是否为 429 */
 
 	bodyReader := bytes.NewReader(codexBody)
 	trySend := func(account *auth.Account, attemptOneBased, maxLabel int, pickDur time.Duration) (*http.Response, error) {
@@ -422,6 +431,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 					log.Debugf("账号 [%s] 已刷新后仍 401，结束同号重试并换号", account.GetEmail())
 					return nil, lastStatus
 				}
+				log.Debugf("账号 [%s] 首次 401，调用 On401Fn 判定是否同号重试", account.GetEmail())
 				if rc.On401Fn(account) {
 					did401Refresh = true
 					log.Debugf("账号 [%s] 401 恢复成功，同请求内立即重试上游", account.GetEmail())
@@ -526,15 +536,43 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			break
 		}
 
+		/* 发送上游前检查 token 新鲜度，即将过期则内联刷新 */
+		if rc.EnsureTokenFreshFn != nil {
+			if !rc.EnsureTokenFreshFn(ctx, account) {
+				excluded[account.FilePath] = true
+				log.Debugf("账号 [%s] token 刷新后仍不可用，换号", account.GetEmail())
+				continue
+			}
+		}
+
 		httpResp, err2 := trySend(account, attempt+1, maxAttempts, pickDur)
 		if err2 == nil {
 			return httpResp, account, attempt + 1, nil
 		}
 		excluded[account.FilePath] = true
+		var se429 *StatusError
+		last429 = errors.As(err2, &se429) && se429.Code == 429
 		done, fatal := handleSendErr(account, attempt, err2)
 		if done {
 			return nil, nil, attempt + 1, fatal
 		}
+	}
+
+	/* 并发重试：遇 429 后并发用多个账号同时尝试，首个成功者胜出 */
+	if last429 && rc.ConcurrentRetry429 && ctx.Err() == nil {
+		log.Infof("429 并发重试启动: model=%s timeout=%v", model, rc.ConcurrentRetry429Timeout)
+		cResp, cAcc, cAccounts, cErr := e.concurrentRetryAfter429(ctx, rc, model, apiURL, codexBody, stream, excluded)
+		if cErr == nil && cResp != nil {
+			return cResp, cAcc, maxAttempts + 1, nil
+		}
+		if cErr != nil {
+			lastErr = cErr
+		}
+		/* 并发重试均失败：清除原始 sendWithRetry 设置的长冷却，改为 3 秒短冷却，确保 bridge 重连和后续请求可继续选号 */
+		for _, a := range cAccounts {
+			a.SetCooldown(3 * time.Second)
+		}
+		log.Warnf("429 并发重试均失败: model=%s err=%v", model, cErr)
 	}
 
 	if lastErr != nil && rc.FallbackRecentPickFn != nil && ctx.Err() == nil {
@@ -569,6 +607,147 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		return nil, nil, maxAttempts, lastErr
 	}
 	return nil, nil, maxAttempts, fmt.Errorf("请求失败")
+}
+
+/* concurrentRetryAfter429 并发扇出重试：同时用多个账号发送请求，首个 2xx 成功者胜出，其余取消 */
+func (e *Executor) concurrentRetryAfter429(
+	parentCtx context.Context,
+	rc RetryConfig,
+	model, apiURL string,
+	codexBody []byte,
+	stream bool,
+	excluded map[string]bool,
+) (*http.Response, *auth.Account, []*auth.Account, error) {
+	timeout := rc.ConcurrentRetry429Timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	/* 尝试选取最多 fanOut 个不同账号 */
+	const fanOut = 5
+	exclCopy := make(map[string]bool, len(excluded)+fanOut)
+	for k, v := range excluded {
+		exclCopy[k] = v
+	}
+	var accounts []*auth.Account
+	/* 第一轮：正常选号（跳过冷却） */
+	for i := 0; i < fanOut; i++ {
+		acc, err := rc.PickFn(model, exclCopy)
+		if err != nil || acc == nil {
+			break
+		}
+		/* token 新鲜度检查 */
+		if rc.EnsureTokenFreshFn != nil && !rc.EnsureTokenFreshFn(parentCtx, acc) {
+			exclCopy[acc.FilePath] = true
+			continue
+		}
+		accounts = append(accounts, acc)
+		exclCopy[acc.FilePath] = true
+	}
+	/* 第二轮：若账号不足，忽略 excluded + 冷却，取回已 429 的账号重试 */
+	if len(accounts) < fanOut && rc.PickIgnoringCooldownFn != nil {
+		exclCooldown := make(map[string]bool, len(accounts))
+		for _, a := range accounts {
+			exclCooldown[a.FilePath] = true
+		}
+		for i := len(accounts); i < fanOut; i++ {
+			acc, err := rc.PickIgnoringCooldownFn(model, exclCooldown)
+			if err != nil || acc == nil {
+				break
+			}
+			if rc.EnsureTokenFreshFn != nil && !rc.EnsureTokenFreshFn(parentCtx, acc) {
+				exclCooldown[acc.FilePath] = true
+				continue
+			}
+			log.Debugf("429 并发重试 取回账号: %s", acc.GetEmail())
+			accounts = append(accounts, acc)
+			exclCooldown[acc.FilePath] = true
+		}
+	}
+	if len(accounts) == 0 {
+		return nil, nil, nil, fmt.Errorf("无可用账号用于并发重试")
+	}
+	log.Infof("429 并发重试选取 %d 个账号: %v", len(accounts), accountEmails(accounts))
+
+	type result struct {
+		resp *http.Response
+		acc  *auth.Account
+		err  error
+	}
+
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+
+	winCh := make(chan result, len(accounts))
+
+	for _, acc := range accounts {
+		go func(account *auth.Account) {
+			body := make([]byte, len(codexBody))
+			copy(body, codexBody)
+			reader := bytes.NewReader(body)
+
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, reader)
+			if err != nil {
+				winCh <- result{nil, account, err}
+				return
+			}
+			applyCodexHeaders(httpReq, account, stream)
+
+			log.Debugf("429 并发重试 发送: account=%s model=%s", account.GetEmail(), model)
+			httpResp, err := e.httpClient.Do(httpReq)
+			if err != nil {
+				account.RecordFailure()
+				winCh <- result{nil, account, err}
+				return
+			}
+			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+				log.Infof("429 并发重试 成功: account=%s status=%d", account.GetEmail(), httpResp.StatusCode)
+				winCh <- result{httpResp, account, nil}
+				return
+			}
+			errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			_ = httpResp.Body.Close()
+			/* 并发重试是“尽力一试”，不再执行 handleAccountError 避免双重惩罚（冷却已由原始 sendWithRetry 设置） */
+			log.Debugf("429 并发重试 失败: account=%s status=%d", account.GetEmail(), httpResp.StatusCode)
+			winCh <- result{nil, account, &StatusError{Code: httpResp.StatusCode, Body: errBody}}
+		}(acc)
+	}
+
+	var lastErr error
+	remaining := len(accounts)
+	for remaining > 0 {
+		select {
+		case r := <-winCh:
+			remaining--
+			if r.err == nil && r.resp != nil {
+				/* 成功，取消其余并发请求 */
+				cancel()
+				return r.resp, r.acc, accounts, nil
+			}
+			if r.err != nil {
+				lastErr = r.err
+			}
+		case <-ctx.Done():
+			log.Warnf("429 并发重试超时: model=%s timeout=%v", model, timeout)
+			if lastErr != nil {
+				return nil, nil, accounts, lastErr
+			}
+			return nil, nil, accounts, ctx.Err()
+		}
+	}
+	if lastErr != nil {
+		return nil, nil, accounts, lastErr
+	}
+	return nil, nil, accounts, fmt.Errorf("429 并发重试均失败")
+}
+
+/* accountEmails 辅助函数：提取账号列表的 email 切片，用于日志 */
+func accountEmails(accs []*auth.Account) []string {
+	names := make([]string, len(accs))
+	for i, a := range accs {
+		names[i] = a.GetEmail()
+	}
+	return names
 }
 
 /**
@@ -1021,7 +1200,7 @@ func applyCodexHeaders(r *http.Request, account *auth.Account, stream bool) {
 	r.Header.Set("User-Agent", codexUserAgent)
 	r.Header.Set("Origin", "https://chatgpt.com")
 	r.Header.Set("Referer", "https://chatgpt.com/")
-	r.Header.Set("Originator", "codex_cli_rs")
+	r.Header.Set("Originator", codexOriginator)
 	r.Header.Set("Connection", "Keep-Alive")
 
 	if stream {

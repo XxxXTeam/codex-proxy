@@ -67,19 +67,23 @@ var responsesWSUpgrader = websocket.FastHTTPUpgrader{
  * @field auth401RecoverTracks - 追踪账号 401 恢复的次数和时间，防止陷入快速循环
  */
 type ProxyHandler struct {
-	manager              *auth.Manager
-	executor             *executor.Executor
-	apiKeys              []string
-	maxRetry             int
-	enableHealthyRetry   bool
-	quotaChecker         *auth.QuotaChecker
-	quotaPrecheck        bool /* true：选号后 wham 预检；false：直发上游，401 换号+异步 OAuth */
-	indexHTML            []byte
-	emptyRetryMax        int
-	debugUpstreamStream  bool     /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
-	enableModelFast      bool     /* 是否允许模型名携带 -fast */
-	enableModel1M        bool     /* 是否允许模型名携带 -1m */
-	auth401RecoverTracks sync.Map /* key: filePath, value: *auth401RecoverTrack */
+	manager                   *auth.Manager
+	executor                  *executor.Executor
+	apiKeys                   []string
+	maxRetry                  int
+	enableHealthyRetry        bool
+	quotaChecker              *auth.QuotaChecker
+	quotaPrecheck             bool /* true：选号后 wham 预检；false：直发上游，401 换号+异步 OAuth */
+	indexHTML                 []byte
+	emptyRetryMax             int
+	debugUpstreamStream       bool          /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
+	enableModelFast           bool          /* 是否允许模型名携带 -fast */
+	enableModel1M             bool          /* 是否允许模型名携带 -1m */
+	enableWebSocket           bool          /* 是否允许 /v1/responses 走 WebSocket */
+	debugWSStream             bool          /* WS 转发时是否打印每帧 debug 日志 */
+	concurrentRetry429        bool          /* 遇 429 时并发重试 */
+	concurrentRetry429Timeout time.Duration /* 并发重试最大等待时间 */
+	auth401RecoverTracks      sync.Map      /* key: filePath, value: *auth401RecoverTrack */
 	/* retryCfg 在首请求时构建一次，避免每条对话重复分配闭包与 RetryConfig */
 	retryCfgOnce sync.Once
 	retryCfg     executor.RetryConfig
@@ -104,7 +108,7 @@ type auth401RecoverTrack struct {
  * @param debugUpstreamStream - 是否 Info 打印上游 Codex SSE 原文（对应配置 debug-upstream-stream）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -127,6 +131,15 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		debugUpstreamStream: debugUpstreamStream,
 		enableModelFast:     enableModelFast,
 		enableModel1M:       enableModel1M,
+		enableWebSocket:     enableWebSocket,
+		debugWSStream:       debugWSStream,
+		concurrentRetry429:  concurrentRetry429,
+		concurrentRetry429Timeout: func() time.Duration {
+			if concurrentRetry429TimeoutSec > 0 {
+				return time.Duration(concurrentRetry429TimeoutSec) * time.Second
+			}
+			return 30 * time.Second
+		}(),
 	}
 }
 
@@ -348,6 +361,9 @@ func (h *ProxyHandler) buildRetryConfigOnce() executor.RetryConfig {
 		PickFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
 			return h.manager.PickExcluding(model, excluded)
 		},
+		EnsureTokenFreshFn: func(ctx context.Context, acc *auth.Account) bool {
+			return h.manager.EnsureTokenFresh(ctx, acc)
+		},
 		On401Fn: func(acc *auth.Account) bool {
 			/* 先换号让当前请求立即继续；对 401 账号在后台提交 OAuth+额度恢复（异步，不阻塞） */
 			if acc == nil {
@@ -373,9 +389,14 @@ func (h *ProxyHandler) buildRetryConfigOnce() executor.RetryConfig {
 				h.manager.InvalidateSelectorCache()
 			}
 		},
-		MaxRetry:            h.maxRetry,
-		EmptyRetryMax:       h.emptyRetryMax,
-		DebugUpstreamStream: h.debugUpstreamStream,
+		MaxRetry:                  h.maxRetry,
+		EmptyRetryMax:             h.emptyRetryMax,
+		DebugUpstreamStream:       h.debugUpstreamStream,
+		ConcurrentRetry429:        h.concurrentRetry429,
+		ConcurrentRetry429Timeout: h.concurrentRetry429Timeout,
+		PickIgnoringCooldownFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
+			return h.manager.PickIgnoringCooldown(model, excluded)
+		},
 	}
 	if h.quotaPrecheck && h.quotaChecker != nil {
 		rc.QuotaCheckFn = func(ctx context.Context, acc *auth.Account) bool {
@@ -602,6 +623,9 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 		ctx.Response.Header.Set("Connection", "keep-alive")
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+			/* 立即 flush 推送 SSE 头到客户端，避免上游思考期间客户端无响应超时 */
+			_, _ = io.WriteString(w, ": ping\n\n")
+			_ = w.Flush()
 			flush := func() { _ = w.Flush() }
 			sw := newStreamBufWriter(w)
 			bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
@@ -878,7 +902,7 @@ func writeSSEProgress(ctx *fasthttp.RequestCtx, ch <-chan auth.ProgressEvent) {
  * 重试逻辑在 executor 内部完成
  */
 func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
-	if isWebSocketUpgradeRequest(ctx) {
+	if h.enableWebSocket && isWebSocketUpgradeRequest(ctx) {
 		h.handleResponsesWS(ctx)
 		return
 	}
@@ -911,6 +935,9 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 		ctx.Response.Header.Set("Connection", "keep-alive")
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+			/* 立即 flush 推送 SSE 头到客户端，避免上游思考期间客户端无响应超时 */
+			_, _ = io.WriteString(w, ": ping\n\n")
+			_ = w.Flush()
 			flush := func() { _ = w.Flush() }
 			sw := newStreamBufWriter(w)
 			bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
@@ -939,19 +966,91 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 	ctx.SetBody(result)
 }
 
+/* wsWriteTimeout WebSocket 写超时 */
+const wsWriteTimeout = 10 * time.Second
+
+/* wsReadTimeout WebSocket 读超时（心跳周期内收不到任何消息则关闭） */
+const wsReadTimeout = 65 * time.Second
+
+/* wsHeartbeatInterval 心跳间隔，需小于 wsReadTimeout */
+const wsHeartbeatInterval = 30 * time.Second
+
+/* wsSession 管理单个 WebSocket 连接的读写、心跳 */
+type wsSession struct {
+	conn      *websocket.Conn
+	writeMu   sync.Mutex
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newWSSession(conn *websocket.Conn) *wsSession {
+	s := &wsSession{conn: conn, closed: make(chan struct{})}
+	conn.SetReadLimit(64 << 20) // 64 MiB
+	_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		return nil
+	})
+	s.startHeartbeat()
+	return s
+}
+
+func (s *wsSession) startHeartbeat() {
+	ticker := time.NewTicker(wsHeartbeatInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.closed:
+				return
+			case <-ticker.C:
+				s.writeMu.Lock()
+				err := s.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(wsWriteTimeout))
+				s.writeMu.Unlock()
+				if err != nil {
+					s.close()
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (s *wsSession) writeMessage(msgType int, data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	return s.conn.WriteMessage(msgType, data)
+}
+
+func (s *wsSession) close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		_ = s.conn.Close()
+	})
+}
+
 func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
+	log.Debugf("responses ws: 升级请求 remote=%s", ctx.RemoteAddr())
 	err := responsesWSUpgrader.Upgrade(ctx, func(conn *websocket.Conn) {
+		sess := newWSSession(conn)
 		defer func() {
-			_ = conn.Close()
+			sess.close()
+			log.Debugf("responses ws: 连接关闭 remote=%s", conn.RemoteAddr())
 		}()
+		log.Debugf("responses ws: 连接已建立 remote=%s", conn.RemoteAddr())
 
 		for {
 			msgType, message, readErr := conn.ReadMessage()
 			if readErr != nil {
+				log.Debugf("responses ws: 读取错误 remote=%s err=%v", conn.RemoteAddr(), readErr)
 				return
 			}
+			if h.debugWSStream {
+				log.Debugf("ws-frame-in: type=%d len=%d payload=%s", msgType, len(message), message)
+			}
 			if msgType != websocket.TextMessage {
-				h.writeWSError(conn, "invalid_request_error", "仅支持文本帧")
+				h.writeWSErrorSession(sess, "invalid_request_error", "仅支持文本帧")
 				continue
 			}
 
@@ -960,7 +1059,7 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 			case "response.create":
 				respObj := gjson.GetBytes(message, "response")
 				if !respObj.Exists() {
-					h.writeWSError(conn, "invalid_request_error", "缺少 response 字段")
+					h.writeWSErrorSession(sess, "invalid_request_error", "缺少 response 字段")
 					continue
 				}
 
@@ -969,33 +1068,35 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 
 				model := gjson.GetBytes(requestBody, "model").String()
 				if model == "" {
-					h.writeWSError(conn, "invalid_request_error", "缺少 model 字段")
+					h.writeWSErrorSession(sess, "invalid_request_error", "缺少 model 字段")
 					continue
 				}
 				if err := h.validateModelSuffixOptions(model); err != nil {
-					h.writeWSError(conn, "invalid_request_error", err.Error())
+					h.writeWSErrorSession(sess, "invalid_request_error", err.Error())
 					continue
 				}
 
 				log.Debugf("responses ws: model=%s", model)
 				rc := h.buildRetryConfig()
-				streamErr := h.forwardResponsesSSEAsWS(ctx, conn, rc, requestBody, model)
+				streamErr := h.forwardResponsesSSEAsWSSession(ctx, sess, rc, requestBody, model)
 				if streamErr == nil {
 					RecordRequest()
 				} else if errors.Is(streamErr, executor.ErrEmptyResponse) {
-					h.writeWSError(conn, "invalid_response", "empty response")
+					h.writeWSErrorSession(sess, "invalid_response", "empty response")
 				} else if statusErr, ok := streamErr.(*executor.StatusError); ok {
-					h.writeWSError(conn, "api_error", summarizeUpstreamError(statusErr.Body))
+					h.writeWSErrorSession(sess, "api_error", summarizeUpstreamError(statusErr.Body))
 				} else {
-					h.writeWSError(conn, "api_error", streamErr.Error())
+					h.writeWSErrorSession(sess, "api_error", streamErr.Error())
 				}
 
 			case "response.cancel", "response.close":
+				sess.writeMu.Lock()
 				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closed"), time.Now().Add(2*time.Second))
+				sess.writeMu.Unlock()
 				return
 
 			default:
-				h.writeWSError(conn, "invalid_request_error", "不支持的事件类型: "+eventType)
+				h.writeWSErrorSession(sess, "invalid_request_error", "不支持的事件类型: "+eventType)
 			}
 		}
 	})
@@ -1004,56 +1105,27 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 	}
 }
 
-func (h *ProxyHandler) forwardResponsesSSEAsWS(ctx context.Context, conn *websocket.Conn, rc executor.RetryConfig, requestBody []byte, model string) error {
-	startTotal := time.Now()
-	emptyRetryMax := h.emptyRetryMax
-	if emptyRetryMax < 0 {
-		emptyRetryMax = 0
-	}
-	excludedForEmpty := make(map[string]bool)
-
-	for emptyAttempt := 0; emptyAttempt <= emptyRetryMax; emptyAttempt++ {
-		rcExcl := executor.MergeRetryConfigExcluded(rc, excludedForEmpty)
-
-		rawResp, account, attempts, baseModel, convertDur, sendDur, err := h.executor.OpenResponsesStream(ctx, rcExcl, requestBody, model)
-		if err != nil {
-			return err
-		}
-
-		hasContent, streamErr := h.pipeSSEToWS(conn, rawResp, ctx)
-		if streamErr != nil {
-			log.Infof("req summary responses-ws model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-			return streamErr
-		}
-
-		if hasContent {
-			account.RecordSuccess()
-			log.Infof("req summary responses-ws model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-			return nil
-		}
-
-		excludedForEmpty[account.FilePath] = true
-		if emptyAttempt < emptyRetryMax {
-			log.Warnf("WS 空返回，换号重试 (account=%s attempt=%d/%d)", account.GetEmail(), emptyAttempt+1, emptyRetryMax+1)
-		}
-	}
-
-	log.Infof("req summary responses-ws (empty after %d tries) total=%v", emptyRetryMax+1, time.Since(startTotal))
-	return executor.ErrEmptyResponse
+func (h *ProxyHandler) forwardResponsesSSEAsWSSession(ctx context.Context, sess *wsSession, rc executor.RetryConfig, requestBody []byte, model string) error {
+	bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
+	/* wsNopWriter 仅负责计数，实际 WS 写入在 pump 内完成 */
+	return h.executor.RunCodexStreamWithOpenBridges(ctx, rc, requestBody, model,
+		&wsNopWriter{}, func() {}, bridges,
+		func(s *executor.CodexResponsesStream, w io.Writer, flush func()) error {
+			return h.pumpSSEToWSSession(s, sess, w, ctx)
+		})
 }
 
-func (h *ProxyHandler) pipeSSEToWS(conn *websocket.Conn, rawResp *executor.RawResponse, ctx context.Context) (bool, error) {
-	defer func() {
-		if rawResp.Body != nil {
-			_ = rawResp.Body.Close()
-		}
-	}()
+/* wsNopWriter 仅用于 RunCodexStreamWithOpenBridges 的 countingWriter 计数，实际写入走 sess.writeMessage */
+type wsNopWriter struct{}
 
+func (w *wsNopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func (h *ProxyHandler) pumpSSEToWSSession(s *executor.CodexResponsesStream, sess *wsSession, countW io.Writer, ctx context.Context) error {
 	hasContent := false
 	flushed := false
 	var buffer [][]byte
 
-	scanner := bufio.NewScanner(rawResp.Body)
+	scanner := bufio.NewScanner(s.Body())
 	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
 
 	for scanner.Scan() {
@@ -1064,6 +1136,10 @@ func (h *ProxyHandler) pipeSSEToWS(conn *websocket.Conn, rawResp *executor.RawRe
 		payload := bytes.TrimSpace(line[5:])
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 			continue
+		}
+
+		if h.debugWSStream {
+			log.Debugf("ws-frame-out: %s", payload)
 		}
 
 		if !hasContent {
@@ -1083,18 +1159,21 @@ func (h *ProxyHandler) pipeSSEToWS(conn *websocket.Conn, rawResp *executor.RawRe
 
 		if !flushed && hasContent {
 			for _, buf := range buffer {
-				if writeErr := conn.WriteMessage(websocket.TextMessage, buf); writeErr != nil {
-					return true, writeErr
+				if writeErr := sess.writeMessage(websocket.TextMessage, buf); writeErr != nil {
+					return writeErr
 				}
+				/* 向 countW 写入以便 bridge 计数 */
+				_, _ = countW.Write(buf)
 			}
 			buffer = nil
 			flushed = true
 		}
 
 		if flushed {
-			if writeErr := conn.WriteMessage(websocket.TextMessage, payload); writeErr != nil {
-				return hasContent, writeErr
+			if writeErr := sess.writeMessage(websocket.TextMessage, payload); writeErr != nil {
+				return writeErr
 			}
+			_, _ = countW.Write(payload)
 		} else {
 			payloadCopy := make([]byte, len(payload))
 			copy(payloadCopy, payload)
@@ -1104,12 +1183,19 @@ func (h *ProxyHandler) pipeSSEToWS(conn *websocket.Conn, rawResp *executor.RawRe
 
 	if scanErr := scanner.Err(); scanErr != nil {
 		if errors.Is(scanErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			return hasContent, nil
+			if hasContent {
+				return nil
+			}
+			return scanErr
 		}
-		return hasContent, scanErr
+		return scanErr
 	}
 
-	return hasContent, nil
+	if !hasContent {
+		return executor.ErrEmptyResponse
+	}
+	s.Account().RecordSuccess()
+	return nil
 }
 
 func (h *ProxyHandler) writeWSError(conn *websocket.Conn, errType, message string) {
@@ -1117,6 +1203,13 @@ func (h *ProxyHandler) writeWSError(conn *websocket.Conn, errType, message strin
 	errBody, _ = sjson.Set(errBody, "error.type", errType)
 	errBody, _ = sjson.Set(errBody, "error.message", message)
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(errBody))
+}
+
+func (h *ProxyHandler) writeWSErrorSession(sess *wsSession, errType, message string) {
+	errBody := `{"type":"error","error":{"type":"","message":""}}`
+	errBody, _ = sjson.Set(errBody, "error.type", errType)
+	errBody, _ = sjson.Set(errBody, "error.message", message)
+	_ = sess.writeMessage(websocket.TextMessage, []byte(errBody))
 }
 
 /**

@@ -41,6 +41,12 @@ type CodexResponsesStream struct {
 	debugUpstreamStream bool
 }
 
+/* Body 返回当前上游响应体，供外部 pump 读取 SSE */
+func (s *CodexResponsesStream) Body() io.ReadCloser { return s.body }
+
+/* Account 返回当前关联的账号 */
+func (s *CodexResponsesStream) Account() *auth.Account { return s.account }
+
 // CodexResponsesMeta bundles metadata returned by openCodexResponsesBody.
 type CodexResponsesMeta struct {
 	Account      *auth.Account
