@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.6.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.5.0...v1.6.0) (2026-04-11)
+
+
+### ✨ 新功能
+
+* 修复部分情况下的账号请求429问题，优化换号与请求实现，完善配置文件相关示例 ([0a59ad9](https://github.com/XxxXTeam/codex-proxy/commit/0a59ad9de8257c854a42a868e4d094920a07b9c4))
+* 添加可选是否显示1m and fast ([53fddea](https://github.com/XxxXTeam/codex-proxy/commit/53fddeabf7504fda2ad21d72a1e377981af7dcd0))
+
+
+### 📦 依赖更新
+
+* **ci:** bump actions/download-artifact from 4 to 8 ([#23](https://github.com/XxxXTeam/codex-proxy/issues/23)) ([37ed431](https://github.com/XxxXTeam/codex-proxy/commit/37ed43151b998b035991412f681c1d5b88b2839a))
+* **ci:** bump actions/upload-artifact from 4 to 7 ([#24](https://github.com/XxxXTeam/codex-proxy/issues/24)) ([eda64e7](https://github.com/XxxXTeam/codex-proxy/commit/eda64e7c14f277700c892715bb24eea796498c74))
+* **go:** bump github.com/lib/pq from 1.12.0 to 1.12.3 ([#22](https://github.com/XxxXTeam/codex-proxy/issues/22)) ([25e876e](https://github.com/XxxXTeam/codex-proxy/commit/25e876e30f94a63d79d5a97bc089296130dd6850))
+* **go:** bump modernc.org/sqlite from 1.48.0 to 1.48.1 ([#21](https://github.com/XxxXTeam/codex-proxy/issues/21)) ([a86e8ef](https://github.com/XxxXTeam/codex-proxy/commit/a86e8eff0eebf5a50e9fbe68dd19997f983f31c2))
+
 ## [1.5.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.4.0...v1.5.0) (2026-04-02)
 
 
