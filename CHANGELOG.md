@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.6.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.6.0...v1.6.1) (2026-04-14)
+
+
+### 📦 依赖更新
+
+* **ci:** bump softprops/action-gh-release from 2 to 3 ([#30](https://github.com/XxxXTeam/codex-proxy/issues/30)) ([b5d0bd1](https://github.com/XxxXTeam/codex-proxy/commit/b5d0bd19f52acac22a28a4deea1289643232019a))
+* **go:** bump github.com/valyala/fasthttp from 1.69.0 to 1.70.0 ([#29](https://github.com/XxxXTeam/codex-proxy/issues/29)) ([abadc64](https://github.com/XxxXTeam/codex-proxy/commit/abadc64a705bdf6562063f4ea5bf33ae76264890))
+* **go:** bump golang.org/x/net in the golang-org-x group ([#27](https://github.com/XxxXTeam/codex-proxy/issues/27)) ([90bf8e7](https://github.com/XxxXTeam/codex-proxy/commit/90bf8e71dbfefad47229e86b3040159904f6a406))
+* **go:** bump modernc.org/sqlite from 1.48.1 to 1.48.2 ([#28](https://github.com/XxxXTeam/codex-proxy/issues/28)) ([2956c27](https://github.com/XxxXTeam/codex-proxy/commit/2956c273e1f8109e830ef884b9a88a55181f885c))
+
+
+### 🎡 持续集成
+
+* 更新依赖版本以及go.sum文件 ([1507119](https://github.com/XxxXTeam/codex-proxy/commit/15071197f2d1b93c182920a109284fe69b026f40))
+
 ## [1.6.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.5.0...v1.6.0) (2026-04-11)
 
 
