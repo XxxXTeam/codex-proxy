@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.2](https://github.com/XxxXTeam/codex-proxy/compare/v1.6.1...v1.6.2) (2026-04-16)
+
+
+### 🐛 错误修复
+
+* 修复1m上下文与fast模式参数传递错误问题，细节优化 ([d601552](https://github.com/XxxXTeam/codex-proxy/commit/d60155275d1ef2d68eb6b26e2e1b2b239a23cd73))
+
 ## [1.6.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.6.0...v1.6.1) (2026-04-14)
 
 
