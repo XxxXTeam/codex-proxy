@@ -48,26 +48,33 @@ func ParseModelSuffix(model string) ParseResult {
 		model = model[:len(model)-5]
 		lower = strings.ToLower(model)
 	}
-	if strings.HasSuffix(lower, "-1m") && len(model) > 3 {
-		result.Is1M = true
-		model = model[:len(model)-3]
+	if strings.HasSuffix(lower, "-image") && len(model) > 6 {
+		result.IsImage = true
+		model = model[:len(model)-6]
 		lower = strings.ToLower(model)
 	}
-	lastDash := strings.LastIndex(model, "-")
-	if lastDash > 0 && lastDash < len(model)-1 {
-		tail := strings.ToLower(model[lastDash+1:])
-		isAmbiguous := knownAmbiguousModels[strings.ToLower(model)]
+	if !result.IsImage {
+		if strings.HasSuffix(lower, "-1m") && len(model) > 3 {
+			result.Is1M = true
+			model = model[:len(model)-3]
+			lower = strings.ToLower(model)
+		}
+		lastDash := strings.LastIndex(model, "-")
+		if lastDash > 0 && lastDash < len(model)-1 {
+			tail := strings.ToLower(model[lastDash+1:])
+			isAmbiguous := knownAmbiguousModels[strings.ToLower(model)]
 
-		if !isAmbiguous {
-			if validThinkingSuffixes[tail] {
-				/* 匹配到思考级别后缀 */
-				result.HasSuffix = true
-				result.RawSuffix = tail
-				model = model[:lastDash]
-			} else if v, err := strconv.Atoi(tail); err == nil && v > 100 {
-				result.HasSuffix = true
-				result.RawSuffix = tail
-				model = model[:lastDash]
+			if !isAmbiguous {
+				if validThinkingSuffixes[tail] {
+					/* 匹配到思考级别后缀 */
+					result.HasSuffix = true
+					result.RawSuffix = tail
+					model = model[:lastDash]
+				} else if v, err := strconv.Atoi(tail); err == nil && v > 100 {
+					result.HasSuffix = true
+					result.RawSuffix = tail
+					model = model[:lastDash]
+				}
 			}
 		}
 	}

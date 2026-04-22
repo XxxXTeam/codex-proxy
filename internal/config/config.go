@@ -119,6 +119,8 @@ type Config struct {
 	EnableModelSuffixFast bool `yaml:"enable-model-suffix-fast"`
 	/* EnableModelSuffix1M 控制是否允许模型名中的 -1m 子参数，并同步影响 /v1/models 枚举 */
 	EnableModelSuffix1M bool `yaml:"enable-model-suffix-1m"`
+	/* EnableModelSuffixImage 控制是否允许模型名中的 -image 子参数，并同步影响 /v1/models 枚举 */
+	EnableModelSuffixImage bool `yaml:"enable-model-suffix-image"`
 
 	/* EnableWebSocket 控制 /v1/responses 是否接受 WebSocket 升级；false 时所有请求走 HTTP SSE */
 	EnableWebSocket bool `yaml:"enable-websocket"`
@@ -131,6 +133,13 @@ type Config struct {
 	Enable429ConcurrentRetry bool `yaml:"enable-429-concurrent-retry"`
 	/* ConcurrentRetry429TimeoutSec 并发重试最大等待时间（秒），0 表示默认 30 秒 */
 	ConcurrentRetry429TimeoutSec int `yaml:"concurrent-retry-429-timeout-sec"`
+
+	/* OAuthCallbackPort OAuth 本地回调服务器端口 */
+	OAuthCallbackPort int `yaml:"oauth-callback-port"`
+	/* OAuthNoBrowser true 时不自动打开浏览器，仅打印授权链接 */
+	OAuthNoBrowser bool `yaml:"oauth-no-browser"`
+	/* EnableCodexLogin 是否启用 Codex 登录接口和 CLI 子命令 */
+	EnableCodexLogin bool `yaml:"enable-codex-login"`
 
 	/* 入站 HTTP/2 (h2c) 等 */
 	EnableListenH2C            bool `yaml:"enable-listen-h2c"`
@@ -207,8 +216,12 @@ func LoadConfig(path string) (*Config, error) {
 		RefreshBatchSize:                 0,
 		EnableModelSuffixFast:            true,
 		EnableModelSuffix1M:              true,
+		EnableModelSuffixImage:           true,
 		EnableWebSocket:                  true,
 		EnableListenH2C:                  true,
+		OAuthCallbackPort:                1455,
+		OAuthNoBrowser:                   false,
+		EnableCodexLogin:                 true,
 		ListenReadHeaderTimeoutSec:       60,
 		ListenIdleTimeoutSec:             180,
 		ListenTCPKeepaliveSec:            30,
@@ -472,6 +485,12 @@ func (c *Config) Sanitize() {
 	}
 	if c.ListenConcurrency > 10_000_000 {
 		c.ListenConcurrency = 10_000_000
+	}
+	if c.OAuthCallbackPort <= 0 {
+		c.OAuthCallbackPort = 1455
+	}
+	if c.OAuthCallbackPort > 65535 {
+		c.OAuthCallbackPort = 1455
 	}
 	if c.UpstreamPoolMaxCap < 0 {
 		c.UpstreamPoolMaxCap = 0

@@ -30,7 +30,7 @@ import (
  * @param stream - 是否为流式请求
  * @returns []byte - 转换后的 Codex Responses API 请求 JSON
  */
-func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) []byte {
+func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool, isImage bool) []byte {
 	out := `{"instructions":""}`
 
 	out, _ = sjson.Set(out, "stream", stream)
@@ -107,6 +107,9 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 		result = fixToolsArraySchema(result)
 		result = convertSystemRoleToDeveloper(result)
 		result = ensureInputContainsJSON(result)
+		if isImage {
+			result = injectImageGeneration(result)
+		}
 
 		return result
 	}
@@ -342,7 +345,31 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 
 	out, _ = sjson.Set(out, "store", false)
 	outBytes := ensureInputContainsJSON([]byte(out))
+	if isImage {
+		outBytes = injectImageGeneration(outBytes)
+	}
 	return outBytes
+}
+
+func injectImageGeneration(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	/* 如果已存在 image_generation 工具则不重复添加 */
+	tools := gjson.GetBytes(body, "tools")
+	if tools.IsArray() {
+		for _, t := range tools.Array() {
+			if t.Get("type").String() == "image_generation" {
+				return body
+			}
+		}
+	}
+	result, _ := sjson.SetBytes(body, "tools.-1", map[string]string{
+		"type":          "image_generation",
+		"output_format": "png",
+	})
+	result, _ = sjson.SetBytes(result, "tool_choice", "auto")
+	return result
 }
 
 /**

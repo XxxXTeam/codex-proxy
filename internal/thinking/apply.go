@@ -37,10 +37,18 @@ var levelToBudgetMap = map[string]int{
  * @param model - 模型名
  * @returns []byte - 处理后的请求体 JSON
  * @returns string - 去除思考后缀与 -fast 后的基础模型名
+ * @returns bool - 是否启用了 image 模式
  */
-func ApplyThinking(body []byte, model string) ([]byte, string) {
+func ApplyThinking(body []byte, model string) ([]byte, string, bool) {
 	parsed := ParseModelSuffix(model)
 	baseModel := strings.TrimSpace(parsed.ModelName)
+
+	if parsed.IsImage {
+		if parsed.IsFast {
+			body, _ = sjson.SetBytes(body, "service_tier", "priority")
+		}
+		return body, baseModel, true
+	}
 
 	var config ThinkingConfig
 	if parsed.HasSuffix {
@@ -59,7 +67,7 @@ func ApplyThinking(body []byte, model string) ([]byte, string) {
 		body, _ = sjson.SetBytes(body, "service_tier", "priority")
 	}
 
-	return body, baseModel
+	return body, baseModel, false
 }
 
 /**

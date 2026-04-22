@@ -163,12 +163,13 @@ startup-async-load: true
 # 连接池保活 ping 间隔（秒）
 # keepalive-interval: 60
 
-# 是否允许模型名使用 -fast / -1m 子参数。
+# 是否允许模型名使用 -fast / -1m / -image 子参数。
 # 关闭后：
 # 1) 请求里显式写了对应后缀会直接返回 400
 # 2) /v1/models 不再枚举对应变体
 # enable-model-suffix-fast: true
 # enable-model-suffix-1m: true
+# enable-model-suffix-image: true
 
 # /v1/responses 是否接受 WebSocket 升级（true 时 WS 客户端自动升级；false 则全部走 HTTP SSE）
 # enable-websocket: true
@@ -183,6 +184,11 @@ startup-async-load: true
 # enable-429-concurrent-retry: false
 # 并发重试最大等待时间（秒），0 表示默认 30 秒
 # concurrent-retry-429-timeout-sec: 30
+
+# OAuth 登录配置
+# oauth-callback-port: 1455
+# oauth-no-browser: false
+# enable-codex-login: true
 
 # 空返回时最多再重试次数
 # empty-retry-max: 2

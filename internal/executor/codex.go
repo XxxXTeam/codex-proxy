@@ -794,8 +794,8 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
 	startTotal := time.Now()
 	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	body, baseModel, isImage := thinking.ApplyThinking(requestBody, model)
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true, isImage)
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
@@ -916,8 +916,8 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, r
 func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
 	startTotal := time.Now()
 	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	body, baseModel, isImage := thinking.ApplyThinking(requestBody, model)
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true, isImage)
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 
@@ -997,8 +997,8 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 
 func (e *Executor) OpenResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, int, string, time.Duration, time.Duration, error) {
 	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	body, baseModel, isImage := thinking.ApplyThinking(requestBody, model)
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true, isImage)
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 
@@ -1063,7 +1063,7 @@ func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryCo
 func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
 	startTotal := time.Now()
 	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
+	body, baseModel, _ := thinking.ApplyThinking(requestBody, model)
 	codexBody := cleanCompactBody(body, baseModel)
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses/compact"
@@ -1092,7 +1092,7 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 // OpenCodexCompactStream 打开 /responses/compact 流式上游连接（2xx 后返回，Body 由 PumpBody 关闭）。
 func (e *Executor) OpenCodexCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*CodexCompactStream, error) {
 	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
+	body, baseModel, _ := thinking.ApplyThinking(requestBody, model)
 	codexBody := cleanCompactBody(body, baseModel)
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses/compact"

@@ -82,5 +82,6 @@ type ParseResult struct {
 	RawSuffix   string
 	IsFast      bool
 	Is1M        bool
+	IsImage     bool
 	ServiceTier string
 }

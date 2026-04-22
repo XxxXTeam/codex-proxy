@@ -79,6 +79,7 @@ type ProxyHandler struct {
 	debugUpstreamStream       bool          /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
 	enableModelFast           bool          /* 是否允许模型名携带 -fast */
 	enableModel1M             bool          /* 是否允许模型名携带 -1m */
+	enableModelImage          bool          /* 是否允许模型名携带 -image */
 	enableWebSocket           bool          /* 是否允许 /v1/responses 走 WebSocket */
 	debugWSStream             bool          /* WS 转发时是否打印每帧 debug 日志 */
 	concurrentRetry429        bool          /* 遇 429 时并发重试 */
@@ -108,7 +109,7 @@ type auth401RecoverTrack struct {
  * @param debugUpstreamStream - 是否 Info 打印上游 Codex SSE 原文（对应配置 debug-upstream-stream）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableModelImage bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -131,6 +132,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		debugUpstreamStream: debugUpstreamStream,
 		enableModelFast:     enableModelFast,
 		enableModel1M:       enableModel1M,
+		enableModelImage:    enableModelImage,
 		enableWebSocket:     enableWebSocket,
 		debugWSStream:       debugWSStream,
 		concurrentRetry429:  concurrentRetry429,
@@ -299,7 +301,7 @@ var modelList = []modelListEntry{
 	{base: "gpt-5.4-mini", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
 }
 
-func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool) []string {
+func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool, enableImage bool) []string {
 	out := []string{id}
 	if enable1M {
 		out = append(out, id+"-1m")
@@ -309,6 +311,12 @@ func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool) []strin
 	}
 	if enableFast && enable1M {
 		out = append(out, id+"-1m-fast", id+"-fast-1m")
+	}
+	if enableImage {
+		out = append(out, id+"-image")
+		if enableFast {
+			out = append(out, id+"-fast-image")
+		}
 	}
 	return out
 }
@@ -322,7 +330,7 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
 			ids = append(ids, e.base+"-"+s)
 		}
 		for _, id := range ids {
-			for _, mid := range expandModelSubvariantIDs(id, h.enableModelFast, h.enableModel1M) {
+			for _, mid := range expandModelSubvariantIDs(id, h.enableModelFast, h.enableModel1M, h.enableModelImage) {
 				models = append(models, map[string]interface{}{"id": mid, "object": "model", "owned_by": "openai"})
 			}
 		}
@@ -341,6 +349,9 @@ func (h *ProxyHandler) validateModelSuffixOptions(model string) error {
 	}
 	if parsed.Is1M && !h.enableModel1M {
 		return fmt.Errorf("模型后缀 -1m 已禁用")
+	}
+	if parsed.IsImage && !h.enableModelImage {
+		return fmt.Errorf("模型后缀 -image 已禁用")
 	}
 	return nil
 }

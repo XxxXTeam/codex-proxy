@@ -1186,6 +1186,15 @@ func (m *Manager) AccountCount() int {
 /**
  * AccountInPool 判断账号是否仍在号池（用于异步任务中途检测是否已移除）
  */
+func (m *Manager) AddAccountFromFile(filePath string) error {
+	acc, err := loadAccountFromFile(filePath)
+	if err != nil {
+		return err
+	}
+	m.mergeAppendAccounts([]*Account{acc})
+	return nil
+}
+
 func (m *Manager) AccountInPool(acc *Account) bool {
 	if acc == nil {
 		return false

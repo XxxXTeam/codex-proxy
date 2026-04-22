@@ -60,6 +60,37 @@ func main() {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 
+	/* 处理子命令 */
+	args := flag.Args()
+	if len(args) > 0 {
+		switch args[0] {
+		case "login":
+			loginFlags := flag.NewFlagSet("login", flag.ExitOnError)
+			device := loginFlags.Bool("device", false, "使用设备代码流登录")
+			_ = loginFlags.Parse(args[1:])
+
+			cfg, err := config.LoadConfig(*configPath)
+			if err != nil {
+				log.Fatalf("加载配置失败: %v", err)
+			}
+			if !cfg.EnableCodexLogin {
+				log.Fatal("Codex 登录已在配置中禁用")
+			}
+
+			var loginErr error
+			if *device {
+				loginErr = handler.HandleCodexDeviceLogin(cfg.AuthDir, cfg.OAuthNoBrowser, nil)
+			} else {
+				loginErr = handler.HandleCodexLogin(cfg.AuthDir, cfg.OAuthCallbackPort, cfg.OAuthNoBrowser, nil)
+			}
+			if loginErr != nil {
+				log.Fatalf("登录失败: %v", loginErr)
+			}
+			log.Info("登录成功")
+			return
+		}
+	}
+
 	/* 处理 --tojson 导出功能 */
 	if *toJSON {
 		if err := exportAccountsToJSON(cfg); err != nil {
@@ -301,8 +332,9 @@ func main() {
 
 	/* 初始化 HTTP 服务 */
 	r := router.New()
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.QuotaPrecheck, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, cfg.EnableModelSuffixFast, cfg.EnableModelSuffix1M, cfg.EnableWebSocket, cfg.DebugWSStream, cfg.Enable429ConcurrentRetry, cfg.ConcurrentRetry429TimeoutSec, static.IndexHTML)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.QuotaPrecheck, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, cfg.EnableModelSuffixFast, cfg.EnableModelSuffix1M, cfg.EnableModelSuffixImage, cfg.EnableWebSocket, cfg.DebugWSStream, cfg.Enable429ConcurrentRetry, cfg.ConcurrentRetry429TimeoutSec, static.IndexHTML)
 	proxyHandler.RegisterRoutes(r)
+	handler.SetupLoginRoutes(r, cfg.AuthDir, cfg.OAuthCallbackPort, cfg.OAuthNoBrowser, cfg.EnableCodexLogin, manager)
 
 	appHandler := r.Handler
 	appHandler = handler.OptionsBypass(appHandler)

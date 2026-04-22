@@ -118,9 +118,9 @@ func codexStreamPumpRounds(maxRetry int) int {
 // Claude 原始流等非 Pump 路径也经此打开，避免 200 + 空 body 导致客户端 SSE 体完全无字节。
 func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (bodyRC io.ReadCloser, meta CodexResponsesMeta, err error) {
 	convertStart := time.Now()
-	thBody, bm := thinking.ApplyThinking(requestBody, model)
+	thBody, bm, isImage := thinking.ApplyThinking(requestBody, model)
 	meta.BaseModel = bm
-	codexBody := translator.ConvertOpenAIRequestToCodex(meta.BaseModel, thBody, true)
+	codexBody := translator.ConvertOpenAIRequestToCodex(meta.BaseModel, thBody, true, isImage)
 	meta.ConvertDur = time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 	sendStart := time.Now()
