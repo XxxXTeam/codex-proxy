@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.6.2...v1.7.0) (2026-04-22)
+
+
+### ✨ 新功能
+
+* 实验性支持Image模型，支持命令行OAuth登录授权Codex账号 ([40a9bfd](https://github.com/XxxXTeam/codex-proxy/commit/40a9bfd722b254fea8e90000eeb759aaaf932fff))
+
+
+### 📦 依赖更新
+
+* **go:** bump modernc.org/sqlite from 1.48.2 to 1.49.1 ([#33](https://github.com/XxxXTeam/codex-proxy/issues/33)) ([dffa40f](https://github.com/XxxXTeam/codex-proxy/commit/dffa40f6f075afea410bc3e919b0254847687f51))
+
 ## [1.6.2](https://github.com/XxxXTeam/codex-proxy/compare/v1.6.1...v1.6.2) (2026-04-16)
 
 
