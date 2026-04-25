@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.7.0...v1.8.0) (2026-04-25)
+
+
+### ✨ 新功能
+
+* 更新内置版本号，新增5.5模型版本枚举 ([0f6e25a](https://github.com/XxxXTeam/codex-proxy/commit/0f6e25a9bd06e248b3a44bf0fc4b9cad0f2aeca6))
+
 ## [1.7.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.6.2...v1.7.0) (2026-04-22)
 
 
