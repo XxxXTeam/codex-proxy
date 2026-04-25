@@ -184,6 +184,7 @@ curl http://localhost:8080/v1/messages \
 | `gpt-5.3-codex` | low, medium, high, xhigh, none, auto | `gpt-5.3-codex`、`gpt-5.3-codex-none-fast` |
 | `gpt-5.4` | low, medium, high, xhigh, none, auto | `gpt-5.4`、`gpt-5.4-xhigh-fast`、`gpt-5.4-xhigh-1m-fast`、`gpt-5.4-auto` |
 | `gpt-5.4-mini` | low, medium, high, xhigh, none, auto | `gpt-5.4-mini`、`gpt-5.4-mini-none-fast` |
+| `gpt-5.5` | low, medium, high, xhigh, none, auto | `gpt-5.5`、`gpt-5.5-xhigh-fast`、`gpt-5.5-xhigh-1m-fast`、`gpt-5.5-auto` |
 
 大上下文示例：`gpt-5.4-1m`、`gpt-5.4-high-1m-fast`、`gpt-5.4-xhigh-1m-fast`。
 

@@ -299,6 +299,7 @@ var modelList = []modelListEntry{
 	{base: "gpt-5.3-codex", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
 	{base: "gpt-5.4", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
 	{base: "gpt-5.4-mini", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
+	{base: "gpt-5.5", suffixes: []string{"none", "minimal", "low", "medium", "high", "xhigh"}},
 }
 
 func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool, enableImage bool) []string {
