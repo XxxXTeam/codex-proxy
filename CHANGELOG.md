@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.8.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.8.0...v1.8.1) (2026-04-29)
+
+
+### 🐛 错误修复
+
+* stream ([1d534c0](https://github.com/XxxXTeam/codex-proxy/commit/1d534c0400c0873bce85cb28db19a1c89f54837c))
+* 非流502 ([24dce68](https://github.com/XxxXTeam/codex-proxy/commit/24dce6885d32cf4750e21ff2ed85b2df5982ca07))
+
+
+### 📦 依赖更新
+
+* **ci:** bump googleapis/release-please-action from 4 to 5 ([#37](https://github.com/XxxXTeam/codex-proxy/issues/37)) ([7d20366](https://github.com/XxxXTeam/codex-proxy/commit/7d20366110655c1f4bdce39f78fc7c309ad75b5f))
+* **go:** bump modernc.org/sqlite from 1.49.1 to 1.50.0 ([#36](https://github.com/XxxXTeam/codex-proxy/issues/36)) ([e6b1aee](https://github.com/XxxXTeam/codex-proxy/commit/e6b1aee4464f286d5516bc4c3d0482c386d87315))
+
 ## [1.8.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.7.0...v1.8.0) (2026-04-25)
 
 
