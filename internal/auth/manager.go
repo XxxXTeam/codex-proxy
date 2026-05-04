@@ -1084,6 +1084,7 @@ func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Accoun
 func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool) (*Account, error) {
 	_ = model
 	allAccounts := *m.accountsPtr.Load()
+	nowMs := time.Now().UnixMilli()
 	/* 按 lastSuccessUnixMs 线性扫描，等价于原 sort 后取最近，避免 O(N log N) */
 	var bestAll *Account
 	var bestAllMs int64 = -1
@@ -1092,6 +1093,9 @@ func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool)
 	for _, acc := range allAccounts {
 		st := AccountStatus(acc.atomicStatus.Load())
 		if st == StatusDisabled || st == StatusCooldown {
+			continue
+		}
+		if !accountPickableAt(nowMs, acc) {
 			continue
 		}
 		ms := acc.lastSuccessUnixMs.Load()
@@ -1118,14 +1122,19 @@ func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool)
 			if st == StatusDisabled || st == StatusCooldown {
 				continue
 			}
-			return acc, nil
+			if accountPickableAt(nowMs, acc) {
+				return acc, nil
+			}
 		}
 		return nil, fmt.Errorf("没有可用账号")
 	}
 	if bestOpen != nil {
 		return bestOpen, nil
 	}
-	return bestAll, nil
+	if accountPickableAt(nowMs, bestAll) {
+		return bestAll, nil
+	}
+	return nil, fmt.Errorf("最近成功账号凭据已过期或暂不可选")
 }
 
 /* betterRecentSuccess 比较「更近的成功时间」，时间相同则 FilePath 较小者优先（与原 sort 稳定序一致） */
@@ -1484,12 +1493,18 @@ func (m *Manager) runRefreshStatusPolicy(ctx context.Context, acc *Account, emai
  * noPolicyRemove：未配置该状态码时 true=删号（强制刷新周期），false=禁用凭据（401 恢复路径）
  */
 func (m *Manager) handleRefreshHTTPError(ctx context.Context, acc *Account, email string, err error, noPolicyRemove bool) (recovered bool, outcome QuotaApplyOutcome) {
+	if IsPermanentOAuthRefreshFailure(err) {
+		log.Warnf("账号 [%s] OAuth refresh 凭据已永久失效，已从号池删除: %v", email, err)
+		m.RemoveAccount(acc, ReasonRefreshFailed)
+		return false, QuotaApplyRemoved
+	}
+
 	status, ok := RefreshHTTPStatusFromErr(err)
 	if !ok {
 		log.Warnf("账号 [%s] 刷新失败: %v", email, err)
 		if m.disableAuth401Remove {
 			log.Warnf("账号 [%s] 已配置不删号/不冷却，保留原状态", email)
-			return false, QuotaApplyCooldown
+			return false, QuotaApplyNone
 		}
 		if noPolicyRemove {
 			m.RemoveAccount(acc, ReasonRefreshFailed)
@@ -1502,7 +1517,7 @@ func (m *Manager) handleRefreshHTTPError(ctx context.Context, acc *Account, emai
 	if !has {
 		if m.disableAuth401Remove {
 			log.Warnf("账号 [%s] 刷新 HTTP %d 无策略，已配置不删号/不冷却，保留原状态", email, status)
-			return false, QuotaApplyCooldown
+			return false, QuotaApplyNone
 		}
 		if noPolicyRemove {
 			log.Warnf("账号 [%s] 刷新 HTTP %d 无策略，移除", email, status)
@@ -2148,7 +2163,7 @@ func mapRecover401FromRefreshOutcome(q QuotaApplyOutcome, email, fp string, refr
 		r.Status = Auth401RecoverDisabled
 		r.ReasonCode = ReasonAuth401Disabled
 	case QuotaApplyCooldown:
-		r.Status = Auth401RecoverCooldown429OK
+		r.Status = Auth401RecoverRefreshFailedCooldown
 	default: /* QuotaApplyNone：如 ctx 取消导致策略未落地，勿误报为 429 额度正常 */
 		r.Status = Auth401RecoverSkippedBusy
 	}
@@ -2209,7 +2224,7 @@ func (m *Manager) RecoverAuth401(ctx context.Context, acc *Account, qc *QuotaChe
 	})
 	out := v.(Auth401RecoverResult)
 	/* singleflight 只执行首个闭包的 recover；等待方 *Account 可能与执行方不同指针，需把已刷新的凭据同步到当前 acc */
-	if out.Status == Auth401RecoverRefreshed {
+	if out.Status == Auth401RecoverRefreshed || out.Status == Auth401RecoverWaitedRefreshIdle {
 		m.syncAccountTokenAfter401Flight(acc)
 	}
 	return out
@@ -2242,7 +2257,8 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 		/* 与后台批量刷新并发时：等对方写完 Token 后本请求同号重试，避免刷新已成功却仍走换号/空解析 */
 		log.Debugf("账号 [%s] 正在他处刷新 Token，401 恢复等待其完成…", email)
 		if m.waitAccountRefreshIdle(ctx, acc) {
-			out.Status = Auth401RecoverRefreshed
+			/* 他处刷新可能已失败，不能冒充 refreshed，否则异步日志与上游重试均误判 */
+			out.Status = Auth401RecoverWaitedRefreshIdle
 			out.Detail = "waited_peer_refresh"
 			log.Debugf("账号 [%s] 401 恢复：已等待进行中的刷新结束，将用当前凭据重试上游", email)
 			return out
@@ -2335,7 +2351,31 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 		out.Status = Auth401RecoverRefreshed
 		return out
 	}
-	return mapRecover401FromRefreshOutcome(qOut, email, fp, err)
+	out = mapRecover401FromRefreshOutcome(qOut, email, fp, err)
+	m.maybeCooldownAfterAuth401RefreshFailure(acc, out, err)
+	return out
+}
+func (m *Manager) maybeCooldownAfterAuth401RefreshFailure(acc *Account, out Auth401RecoverResult, refreshErr error) {
+	if m == nil || acc == nil || refreshErr == nil || !m.disableAuth401Remove {
+		return
+	}
+	if out.Status != Auth401RecoverSkippedBusy {
+		return
+	}
+	st, ok := RefreshHTTPStatusFromErr(refreshErr)
+	if !ok || (st != 400 && st != 401) {
+		return
+	}
+	sec := m.cooldown401Sec
+	if sec < 1 {
+		sec = defaultCooldown401Sec
+	}
+	acc.SetCooldown(time.Duration(sec) * time.Second)
+	m.InvalidateSelectorCache()
+	if m.db != nil {
+		m.enqueueSave(acc)
+	}
+	log.Warnf("账号 [%s] OAuth 刷新鉴权失败 (HTTP %d)，已冷却 %ds 以便换号（disable-auth-401-remove）", acc.GetEmail(), st, sec)
 }
 
 /**
@@ -2357,8 +2397,10 @@ func (m *Manager) ScheduleRecoverAfterAuth401(acc *Account, qc *QuotaChecker) {
 		defer hcancel()
 		out := m.RecoverAuth401(hctx, a, q)
 		switch out.Status {
-		case Auth401RecoverRefreshed, Auth401RecoverCooldown429OK:
+		case Auth401RecoverRefreshed:
 			log.Infof("异步 401 恢复成功: %s", a.GetEmail())
+		case Auth401RecoverRefreshFailedCooldown:
+			log.Warnf("异步 401 恢复未刷新 Token: %s（已按策略冷却）detail=%s", a.GetEmail(), out.Detail)
 		default:
 			log.Debugf("异步 401 恢复结束 [%s]: status=%s detail=%s", a.GetEmail(), out.Status, out.Detail)
 		}

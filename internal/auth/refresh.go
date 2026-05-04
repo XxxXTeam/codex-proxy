@@ -237,7 +237,34 @@ func isNonRetryableErr(err error) bool {
 		return false
 	}
 	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "refresh_token_reused")
+	if strings.Contains(raw, "refresh_token_reused") {
+		return true
+	}
+	return strings.Contains(raw, "already been used")
+}
+
+
+func IsPermanentOAuthRefreshFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(err.Error())
+	if strings.Contains(raw, "already been used") || strings.Contains(raw, "refresh_token_reused") {
+		return true
+	}
+	if strings.Contains(raw, "invalid_grant") {
+		return true
+	}
+	if strings.Contains(raw, "try signing in again") {
+		return true
+	}
+	if strings.Contains(raw, "has been revoked") || strings.Contains(raw, "been revoked") {
+		return true
+	}
+	if strings.Contains(raw, "invalid refresh token") {
+		return true
+	}
+	return false
 }
 
 /**

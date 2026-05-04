@@ -322,18 +322,14 @@ func IsRetryableOpenCodexError(err error) bool {
 	}
 	var se *StatusError
 	if errors.As(err, &se) {
-		return IsRetryableStatus(se.Code)
+		return shouldSwitchAccountForUpstreamError(se.Code, se.Body)
 	}
 	return netutil.IsRetryableUpstreamNetError(err)
 }
 
 /**
- * IsRetryableStatus 判断 HTTP 状态码是否可重试（切换账号重试）
- * 403（地域封锁 / Cloudflare 拦截）换账号也无法解决，不重试
- * 400（参数/模型错误）也不重试
- * 401（认证失效）、429（限频）、5xx 均可切换账号重试
- * @param code - HTTP 状态码
- * @returns bool - 是否可重试
+ * IsRetryableStatus 仅按状态码判断是否可换号重试（403/400 默认不重试）。
+ * 带响应体的策略请用 shouldSwitchAccountForUpstreamError：400/403+额度 JSON 会换号。
  */
 func IsRetryableStatus(code int) bool {
 	if code >= 200 && code < 300 {
@@ -418,7 +414,8 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 				rc.OnAfterUpstreamErrFn(account, httpResp.StatusCode)
 			}
 
-			if httpResp.StatusCode == 429 && rc.On429RecoveryFn != nil {
+			if rc.On429RecoveryFn != nil && (httpResp.StatusCode == http.StatusTooManyRequests ||
+				isCodexUsageQuotaExceededJSON(codexQuotaPayloadForCooldown(errBody))) {
 				go rc.On429RecoveryFn(context.Background(), account)
 			}
 
@@ -456,7 +453,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		var se *StatusError
 		if errors.As(err2, &se) {
 			lastErr = err2
-			if !IsRetryableStatus(se.Code) {
+			if !shouldSwitchAccountForUpstreamError(se.Code, se.Body) {
 				log.Debugf("send attempt non-retryable status=%d account=%s", se.Code, account.GetEmail())
 				return true, se
 			}
@@ -550,7 +547,9 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		}
 		excluded[account.FilePath] = true
 		var se429 *StatusError
-		last429 = errors.As(err2, &se429) && se429.Code == 429
+		/* 额度类错误（含 HTTP 403/400 + usage_limit JSON）也走 429 并发扇出，尽快换到有余额的号 */
+		last429 = errors.As(err2, &se429) && (se429.Code == http.StatusTooManyRequests ||
+			isCodexUsageQuotaExceededJSON(codexQuotaPayloadForCooldown(se429.Body)))
 		done, fatal := handleSendErr(account, attempt, err2)
 		if done {
 			return nil, nil, attempt + 1, fatal
@@ -575,7 +574,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 	}
 
 	if lastErr != nil && rc.FallbackRecentPickFn != nil && ctx.Err() == nil {
-		if se, ok := lastErr.(*StatusError); ok && !IsRetryableStatus(se.Code) {
+		if se, ok := lastErr.(*StatusError); ok && !shouldSwitchAccountForUpstreamError(se.Code, se.Body) {
 			// 400/403 等不重试、不回退
 		} else {
 			fallbackAcc, perr := rc.FallbackRecentPickFn(model, excluded)
@@ -592,7 +591,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 				var se2 *StatusError
 				if errors.As(err2, &se2) {
 					lastErr = err2
-					if !IsRetryableStatus(se2.Code) {
+					if !shouldSwitchAccountForUpstreamError(se2.Code, se2.Body) {
 						return nil, nil, fbLabel, se2
 					}
 				} else {
@@ -1261,12 +1260,15 @@ func applyCodexHeaders(r *http.Request, account *auth.Account, stream bool) {
  */
 func handleAccountError(account *auth.Account, statusCode int, body []byte) {
 	account.RecordFailure()
+	payload := codexQuotaPayloadForCooldown(body)
 
 	switch {
-	case statusCode == 429:
-		cooldown := parseRetryAfter(body)
+	case statusCode == 429 || (statusCode == http.StatusForbidden && isCodexUsageQuotaExceededJSON(payload)) || (statusCode == http.StatusBadRequest && isCodexUsageQuotaExceededJSON(payload)):
+		cooldown := parseRetryAfter(payload)
 		if cooldown > 0 {
 			account.SetQuotaCooldown(cooldown)
+		} else {
+			account.SetQuotaCooldown(60 * time.Second)
 		}
 	case statusCode == 403:
 		account.SetCooldown(5 * time.Minute)
@@ -1340,9 +1342,87 @@ func summarizeError(body []byte) string {
 }
 
 /**
- * parseRetryAfter 从 429 错误响应中解析冷却时间
- * @param body - 错误响应体
- * @returns time.Duration - 冷却持续时间
+ * isCodexUsageQuotaExceededJSON 判断 Codex /responses 错误 JSON 是否表示账号额度用尽（应换号而非当参数错终止）。
+ */
+func isCodexUsageQuotaExceededJSON(b []byte) bool {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 {
+		return false
+	}
+	t := strings.ToLower(strings.TrimSpace(gjson.GetBytes(b, "error.type").String()))
+	switch t {
+	case "usage_limit_reached", "usage_limit_exceeded", "billing_hard_cap_reached":
+		return true
+	}
+	t2 := strings.ToLower(strings.TrimSpace(gjson.GetBytes(b, "response.error.type").String()))
+	switch t2 {
+	case "usage_limit_reached", "usage_limit_exceeded", "billing_hard_cap_reached":
+		return true
+	}
+	msg := strings.ToLower(gjson.GetBytes(b, "error.message").String())
+	if strings.Contains(msg, "usage limit has been reached") {
+		return true
+	}
+	msg2 := strings.ToLower(gjson.GetBytes(b, "response.error.message").String())
+	if strings.Contains(msg2, "usage limit has been reached") {
+		return true
+	}
+	return false
+}
+
+/**
+ * codexQuotaPayloadForCooldown 从原始响应体或 SSE 多行中提取可供 parseRetryAfter / gjson 解析的 JSON 对象字节。
+ */
+func codexQuotaPayloadForCooldown(body []byte) []byte {
+	b := bytes.TrimSpace(body)
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[5:])
+		if len(payload) > 0 && payload[0] == '{' {
+			return payload
+		}
+	}
+	return b
+}
+
+/**
+ * upstreamPrefixIndicatesUsageQuotaExceeded 探测 SSE/原始前缀中是否出现额度用尽（含跨行 JSON 片段）。
+ */
+func upstreamPrefixIndicatesUsageQuotaExceeded(prefix []byte) bool {
+	if len(prefix) == 0 {
+		return false
+	}
+	if isCodexUsageQuotaExceededJSON(codexQuotaPayloadForCooldown(prefix)) {
+		return true
+	}
+	lower := strings.ToLower(string(prefix))
+	if strings.Contains(lower, "usage_limit_reached") || strings.Contains(lower, "usage_limit_exceeded") || strings.Contains(lower, "billing_hard_cap_reached") {
+		return true
+	}
+	if strings.Contains(lower, "the usage limit has been reached") {
+		return true
+	}
+	return false
+}
+
+/**
+ * shouldSwitchAccountForUpstreamError 是否应在 sendWithRetry 中换号重试（含 400/403+额度 JSON 与常规 429/5xx）。
+ */
+func shouldSwitchAccountForUpstreamError(code int, body []byte) bool {
+	if isCodexUsageQuotaExceededJSON(codexQuotaPayloadForCooldown(body)) {
+		switch code {
+		case http.StatusBadRequest, http.StatusForbidden, http.StatusTooManyRequests:
+			return true
+		}
+	}
+	return IsRetryableStatus(code)
+}
+
+/**
+ * parseRetryAfter 从 429 / 额度错误 JSON 中解析冷却时间（resets_at / resets_in_seconds）。
  */
 func parseRetryAfter(body []byte) time.Duration {
 	if len(body) == 0 {

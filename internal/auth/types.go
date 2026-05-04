@@ -158,12 +158,16 @@ const (
 type Auth401RecoverStatus string
 
 const (
-	Auth401RecoverInvalid       Auth401RecoverStatus = "invalid_input"
-	Auth401RecoverSkippedBusy   Auth401RecoverStatus = "skipped_busy"
-	Auth401RecoverRefreshed     Auth401RecoverStatus = "refreshed"
-	Auth401RecoverCooldown429OK Auth401RecoverStatus = "cooldown_429_quota_ok"
-	Auth401RecoverDisabled      Auth401RecoverStatus = "disabled"
-	Auth401RecoverRemoved       Auth401RecoverStatus = "removed"
+	Auth401RecoverInvalid            Auth401RecoverStatus = "invalid_input"
+	Auth401RecoverSkippedBusy        Auth401RecoverStatus = "skipped_busy"
+	Auth401RecoverRefreshed          Auth401RecoverStatus = "refreshed"
+	Auth401RecoverWaitedRefreshIdle  Auth401RecoverStatus = "waited_refresh_idle"
+	/* Auth401RecoverRefreshFailedCooldown 刷新失败且策略落地为冷却（含 401/429 等），并非 Token 已恢复 */
+	Auth401RecoverRefreshFailedCooldown Auth401RecoverStatus = "refresh_failed_cooldown"
+	/* Auth401RecoverCooldown429OK 历史兼容；新逻辑请用 refresh_failed_cooldown 或 refreshed */
+	Auth401RecoverCooldown429OK      Auth401RecoverStatus = "cooldown_429_quota_ok"
+	Auth401RecoverDisabled            Auth401RecoverStatus = "disabled"
+	Auth401RecoverRemoved             Auth401RecoverStatus = "removed"
 )
 
 /**

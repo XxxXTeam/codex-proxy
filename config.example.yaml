@@ -175,6 +175,8 @@ startup-async-load: true
 # enable-websocket: true
 
 # 401 刷新失败后：true 时只冷却保留账号（等周期刷新再尝试）；false 时删号/禁用（默认行为）
+# 注意：OAuth 返回「refresh 已轮换/撤销、invalid_grant、signing in again」等永久失效时仍会删号，避免死号进入「最近成功」反复占用。
+# 若需对其它 401 也强制删号，请显式配置 refresh-http-status-policy 的 "401".final: remove
 # disable-auth-401-remove: false
 
 # WS 转发调试：每帧都打 Debug 日志（排障时短期开启，日志量大）
