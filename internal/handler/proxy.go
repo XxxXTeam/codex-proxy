@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,7 +75,7 @@ type ProxyHandler struct {
 	enableHealthyRetry        bool
 	quotaChecker              *auth.QuotaChecker
 	quotaPrecheck             bool /* true：选号后 wham 预检；false：直发上游，401 换号+异步 OAuth */
-	indexHTML                 []byte
+	staticAssets              fs.FS
 	emptyRetryMax             int
 	debugUpstreamStream       bool          /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
 	enableModelFast           bool          /* 是否允许模型名携带 -fast */
@@ -109,7 +110,7 @@ type auth401RecoverTrack struct {
  * @param debugUpstreamStream - 是否 Info 打印上游 Codex SSE 原文（对应配置 debug-upstream-stream）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableModelImage bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableModelImage bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, staticAssets fs.FS) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -127,7 +128,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		enableHealthyRetry:  enableHealthyRetry,
 		quotaChecker:        quotaChecker,
 		quotaPrecheck:       quotaPrecheck,
-		indexHTML:           indexHTML,
+		staticAssets:        staticAssets,
 		emptyRetryMax:       emptyRetryMax,
 		debugUpstreamStream: debugUpstreamStream,
 		enableModelFast:     enableModelFast,
@@ -152,6 +153,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 	/* 首页 */
 	r.GET("/", h.handleIndex)
+	r.GET("/assets/{filepath:*}", h.handleStaticAsset)
 
 	/* 健康检查 */
 	r.GET("/health", h.handleHealth)
@@ -204,11 +206,23 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 	r.POST("/recover-auth", recoverAuthHandler)
 
 	accountsIngestHandler := h.handleAccountsIngest
+	accountsCreateHandler := h.handleAdminAccountsCreate
+	accountsUpdateHandler := h.handleAdminAccountsUpdate
+	accountsDeleteHandler := h.handleAdminAccountsDelete
+	accountsProbeHandler := h.handleAdminAccountsProbe
 	if len(h.apiKeys) > 0 {
 		accountsIngestHandler = h.authMiddleware(h.handleAccountsIngest)
+		accountsCreateHandler = h.authMiddleware(h.handleAdminAccountsCreate)
+		accountsUpdateHandler = h.authMiddleware(h.handleAdminAccountsUpdate)
+		accountsDeleteHandler = h.authMiddleware(h.handleAdminAccountsDelete)
+		accountsProbeHandler = h.authMiddleware(h.handleAdminAccountsProbe)
 	}
 	r.POST("/admin/accounts/ingest", accountsIngestHandler)
 	r.GET("/admin/accounts/ingest", accountsIngestHandler)
+	r.POST("/admin/accounts", accountsCreateHandler)
+	r.PUT("/admin/accounts", accountsUpdateHandler)
+	r.DELETE("/admin/accounts", accountsDeleteHandler)
+	r.POST("/admin/accounts/probe", accountsProbeHandler)
 }
 
 /**

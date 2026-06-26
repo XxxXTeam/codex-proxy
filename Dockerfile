@@ -1,13 +1,16 @@
 # 阶段一：构建
 FROM golang:1.25-alpine AS builder
 
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache git ca-certificates nodejs npm
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 COPY . .
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefix web && npm run build --prefix web
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \

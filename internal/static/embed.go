@@ -1,6 +1,6 @@
 package static
 
-import _ "embed"
+import "embed"
 
-//go:embed assets/index.html
-var IndexHTML []byte
+//go:embed assets/*
+var Assets embed.FS

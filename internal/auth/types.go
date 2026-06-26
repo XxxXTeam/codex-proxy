@@ -55,6 +55,7 @@ type TokenFile struct {
 	Email       string `json:"email"`
 	Type        string `json:"type"`
 	Expire      string `json:"expired"`
+	PlanType    string `json:"plan_type,omitempty"`
 }
 
 /**
@@ -158,16 +159,16 @@ const (
 type Auth401RecoverStatus string
 
 const (
-	Auth401RecoverInvalid            Auth401RecoverStatus = "invalid_input"
-	Auth401RecoverSkippedBusy        Auth401RecoverStatus = "skipped_busy"
-	Auth401RecoverRefreshed          Auth401RecoverStatus = "refreshed"
-	Auth401RecoverWaitedRefreshIdle  Auth401RecoverStatus = "waited_refresh_idle"
+	Auth401RecoverInvalid           Auth401RecoverStatus = "invalid_input"
+	Auth401RecoverSkippedBusy       Auth401RecoverStatus = "skipped_busy"
+	Auth401RecoverRefreshed         Auth401RecoverStatus = "refreshed"
+	Auth401RecoverWaitedRefreshIdle Auth401RecoverStatus = "waited_refresh_idle"
 	/* Auth401RecoverRefreshFailedCooldown 刷新失败且策略落地为冷却（含 401/429 等），并非 Token 已恢复 */
 	Auth401RecoverRefreshFailedCooldown Auth401RecoverStatus = "refresh_failed_cooldown"
 	/* Auth401RecoverCooldown429OK 历史兼容；新逻辑请用 refresh_failed_cooldown 或 refreshed */
-	Auth401RecoverCooldown429OK      Auth401RecoverStatus = "cooldown_429_quota_ok"
-	Auth401RecoverDisabled            Auth401RecoverStatus = "disabled"
-	Auth401RecoverRemoved             Auth401RecoverStatus = "removed"
+	Auth401RecoverCooldown429OK Auth401RecoverStatus = "cooldown_429_quota_ok"
+	Auth401RecoverDisabled      Auth401RecoverStatus = "disabled"
+	Auth401RecoverRemoved       Auth401RecoverStatus = "removed"
 )
 
 /**
@@ -193,9 +194,12 @@ type Auth401RecoverResult struct {
  * @field CooldownUntil - 冷却结束时间
  */
 type AccountStats struct {
+	AccountID           string     `json:"account_id,omitempty"`
 	Email               string     `json:"email"`
+	FilePath            string     `json:"file_path,omitempty"`
 	Status              string     `json:"status"`
 	PlanType            string     `json:"plan_type,omitempty"`
+	HasRefreshToken     bool       `json:"has_refresh_token"`
 	DisableReason       string     `json:"disable_reason,omitempty"`
 	TotalRequests       int64      `json:"total_requests"`
 	TotalErrors         int64      `json:"total_errors"`
@@ -586,9 +590,12 @@ func (a *Account) GetStats() AccountStats {
 	}
 
 	return AccountStats{
+		AccountID:           a.Token.AccountID,
 		Email:               a.Token.Email,
+		FilePath:            a.FilePath,
 		Status:              statusStr,
 		PlanType:            a.Token.PlanType,
+		HasRefreshToken:     strings.TrimSpace(a.Token.RefreshToken) != "",
 		DisableReason:       a.DisableReason,
 		TotalRequests:       a.TotalRequests.Load(),
 		TotalErrors:         a.TotalErrors.Load(),

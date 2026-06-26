@@ -332,7 +332,7 @@ func main() {
 
 	/* 初始化 HTTP 服务 */
 	r := router.New()
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.QuotaPrecheck, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, cfg.EnableModelSuffixFast, cfg.EnableModelSuffix1M, cfg.EnableModelSuffixImage, cfg.EnableWebSocket, cfg.DebugWSStream, cfg.Enable429ConcurrentRetry, cfg.ConcurrentRetry429TimeoutSec, static.IndexHTML)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.QuotaPrecheck, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, cfg.EnableModelSuffixFast, cfg.EnableModelSuffix1M, cfg.EnableModelSuffixImage, cfg.EnableWebSocket, cfg.DebugWSStream, cfg.Enable429ConcurrentRetry, cfg.ConcurrentRetry429TimeoutSec, static.Assets)
 	proxyHandler.RegisterRoutes(r)
 	handler.SetupLoginRoutes(r, cfg.AuthDir, cfg.OAuthCallbackPort, cfg.OAuthNoBrowser, cfg.EnableCodexLogin, manager)
 

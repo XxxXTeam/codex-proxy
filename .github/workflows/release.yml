@@ -60,6 +60,20 @@ jobs:
           go-version: "1.25.0"
           cache: true
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm ci
+
+      - name: 构建嵌入前端
+        working-directory: web
+        run: npm run build
+
       - run: go mod download
 
       - name: 交叉编译

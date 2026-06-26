@@ -2604,6 +2604,7 @@ func (m *Manager) saveTokenToFile(acc *Account) error {
 		Email:        acc.Token.Email,
 		Type:         "codex",
 		Expire:       acc.Token.Expire,
+		PlanType:     acc.Token.PlanType,
 	}
 	filePath := acc.FilePath
 	acc.mu.RUnlock()
