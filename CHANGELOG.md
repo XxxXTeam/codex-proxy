@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.9.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.8.1...v1.9.0) (2026-06-26)
+
+
+### ✨ 新功能
+
+* add Codex Proxy web dashboard ([ec0ab3e](https://github.com/XxxXTeam/codex-proxy/commit/ec0ab3e3224ecc7de65a809cc1947a15446038a0))
+* 修复特定情况下的换号逻辑错误问题 ([622d08d](https://github.com/XxxXTeam/codex-proxy/commit/622d08d31b740488c953f968f755551b02b1c3be))
+
+
+### 📦 依赖更新
+
+* **go:** bump github.com/tidwall/gjson in the tidwall group ([#42](https://github.com/XxxXTeam/codex-proxy/issues/42)) ([5f2b6cc](https://github.com/XxxXTeam/codex-proxy/commit/5f2b6cca46e4ee1e3afd734b956bd7486346843b))
+* **go:** bump github.com/valyala/fasthttp from 1.70.0 to 1.71.0 ([#43](https://github.com/XxxXTeam/codex-proxy/issues/43)) ([6a1d529](https://github.com/XxxXTeam/codex-proxy/commit/6a1d529051f9b0864c6e944ac4b65f94a32ee69c))
+* **go:** bump golang.org/x/net in the golang-org-x group ([#41](https://github.com/XxxXTeam/codex-proxy/issues/41)) ([88bb53a](https://github.com/XxxXTeam/codex-proxy/commit/88bb53aa30dba453a83a241ab7e44ff52ee30b83))
+* **go:** bump golang.org/x/net in the golang-org-x group ([#48](https://github.com/XxxXTeam/codex-proxy/issues/48)) ([76848b7](https://github.com/XxxXTeam/codex-proxy/commit/76848b739a4b7d6a557364100d06608fc2f69a84))
+* **go:** bump modernc.org/sqlite from 1.50.0 to 1.50.1 ([#44](https://github.com/XxxXTeam/codex-proxy/issues/44)) ([0094e4b](https://github.com/XxxXTeam/codex-proxy/commit/0094e4b9b93083f1a095d05891bec4428b9ebff5))
+* **go:** bump modernc.org/sqlite from 1.50.1 to 1.52.0 ([#50](https://github.com/XxxXTeam/codex-proxy/issues/50)) ([e6e08f2](https://github.com/XxxXTeam/codex-proxy/commit/e6e08f285777f1c02ebb335b0caa12ef128bc4ff))
+* **go:** bump the golang-org-x group with 2 updates ([#51](https://github.com/XxxXTeam/codex-proxy/issues/51)) ([696c95b](https://github.com/XxxXTeam/codex-proxy/commit/696c95b4aaf4f36dc478f07843c22f490a13b76e))
+
 ## [1.8.1](https://github.com/XxxXTeam/codex-proxy/compare/v1.8.0...v1.8.1) (2026-04-29)
 
 
