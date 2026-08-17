@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	codexmeta "codex-proxy/internal/auth/codex"
 	"codex-proxy/internal/netutil"
 
 	log "github.com/sirupsen/logrus"
@@ -239,12 +240,8 @@ func (hc *HealthChecker) checkAccount(ctx context.Context, manager *Manager, acc
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", "https://chatgpt.com")
-	req.Header.Set("Referer", "https://chatgpt.com/")
+	codexmeta.ApplyClientHeaders(req.Header, accountID)
 	req.Header.Set("X-Health-Check", "1")
-	if accountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", accountID)
-	}
 
 	resp, err := hc.httpClient.Do(req)
 	if err != nil {

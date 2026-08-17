@@ -30,6 +30,7 @@ Codex API 代理服务，提供 OpenAI / Claude 多协议兼容接口，支持�
 - **额度查询** — 支持查询每个账号的剩余额度，按额度使用率排序选号
 - **热加载** — 运行时自动扫描新增账号文件，无需重启
 - **禁用凭据周期清理（磁盘）** — 默认按间隔恢复 `*.json.disabled` 并探测，失败则删文件，减轻目录膨胀（`disabled-recovery-interval-sec`，`0` 关闭）
+- **Codex 客户端目录** — 自动刷新远端 Codex 客户端模型目录，`GET /v1/models?client_version=...` 返回最新 reasoning 等级和客户端版本信息
 - **Tool Schema 自动修复** — 自动补全 `type: array` 缺少 `items` 的 JSON Schema，避免上游 400 错误
 - **连接池保活** — 定时 ping 上游保持 TCP+TLS 连接，消除冷启动延迟
 - **API Key 鉴权** — 可选的访问密钥保护
@@ -185,6 +186,9 @@ curl http://localhost:8080/v1/messages \
 | `gpt-5.4` | low, medium, high, xhigh, none, auto | `gpt-5.4`、`gpt-5.4-xhigh-fast`、`gpt-5.4-xhigh-1m-fast`、`gpt-5.4-auto` |
 | `gpt-5.4-mini` | low, medium, high, xhigh, none, auto | `gpt-5.4-mini`、`gpt-5.4-mini-none-fast` |
 | `gpt-5.5` | low, medium, high, xhigh, none, auto | `gpt-5.5`、`gpt-5.5-xhigh-fast`、`gpt-5.5-xhigh-1m-fast`、`gpt-5.5-auto` |
+| `gpt-5.6-sol` | low, medium, high, xhigh, max, ultra, auto | `gpt-5.6-sol`、`gpt-5.6-sol-max`、`gpt-5.6-sol-ultra` |
+| `gpt-5.6-terra` | low, medium, high, xhigh, max, ultra, auto | `gpt-5.6-terra`、`gpt-5.6-terra-max`、`gpt-5.6-terra-ultra` |
+| `gpt-5.6-luna` | low, medium, high, xhigh, max, auto | `gpt-5.6-luna`、`gpt-5.6-luna-max` |
 
 大上下文示例：`gpt-5.4-1m`、`gpt-5.4-high-1m-fast`、`gpt-5.4-xhigh-1m-fast`。
 
@@ -196,7 +200,7 @@ curl http://localhost:8080/v1/messages \
 | POST | `/v1/responses` | Responses API（流式/非流式） |
 | POST | `/v1/responses/compact` | Responses Compact API（对话历史压缩） |
 | POST | `/v1/messages` | Claude Messages API（流式/非流式） |
-| GET | `/v1/models` | 模型列表 |
+| GET | `/v1/models` | 模型列表（支持 `?client_version=...` 返回 Codex 客户端目录） |
 | GET | `/health` | 健康检查 |
 | GET | `/stats` | 账号统计（状态/请求数/错误数/额度） |
 | POST | `/recover-auth` | 401 恢复：同步刷新 Token；失败可将凭据重命名为 `*.json.disabled`（见 `config.example.yaml`） |

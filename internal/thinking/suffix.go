@@ -16,6 +16,7 @@ var validThinkingSuffixes = map[string]bool{
 	"high":    true,
 	"xhigh":   true,
 	"max":     true,
+	"ultra":   true,
 	"none":    true,
 	"auto":    true,
 }
@@ -111,6 +112,8 @@ func ParseSuffixToConfig(rawSuffix string) ThinkingConfig {
 		return ThinkingConfig{Mode: ModeLevel, Level: LevelXHigh}
 	case "max":
 		return ThinkingConfig{Mode: ModeLevel, Level: LevelMax}
+	case "ultra":
+		return ThinkingConfig{Mode: ModeLevel, Level: LevelUltra}
 	}
 	if value, err := strconv.Atoi(rawSuffix); err == nil {
 		if value == 0 {

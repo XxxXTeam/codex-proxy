@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"codex-proxy/internal/auth"
+	"codex-proxy/internal/codexcatalog"
 	"codex-proxy/internal/executor"
 	"codex-proxy/internal/thinking"
 
@@ -314,6 +315,9 @@ var modelList = []modelListEntry{
 	{base: "gpt-5.4", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
 	{base: "gpt-5.4-mini", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
 	{base: "gpt-5.5", suffixes: []string{"none", "minimal", "low", "medium", "high", "xhigh"}},
+	{base: "gpt-5.6-sol", suffixes: []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}},
+	{base: "gpt-5.6-terra", suffixes: []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}},
+	{base: "gpt-5.6-luna", suffixes: []string{"low", "medium", "high", "xhigh", "max", "auto"}},
 }
 
 func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool, enableImage bool) []string {
@@ -337,6 +341,13 @@ func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool, enableI
 }
 
 func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
+	if ctx.QueryArgs().Has("client_version") {
+		if response := codexcatalog.Response(); response != nil {
+			writeJSON(ctx, fasthttp.StatusOK, response)
+			return
+		}
+	}
+
 	models := make([]map[string]interface{}, 0, 800)
 	for _, e := range modelList {
 		ids := make([]string, 0, 1+len(e.suffixes))

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	codexmeta "codex-proxy/internal/auth/codex"
 	"codex-proxy/internal/netutil"
 
 	log "github.com/sirupsen/logrus"
@@ -293,12 +294,7 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) (verdict
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)")
-	req.Header.Set("Origin", "https://chatgpt.com")
-	req.Header.Set("Referer", "https://chatgpt.com/")
-	if accountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", accountID)
-	}
+	codexmeta.ApplyClientHeaders(req.Header, accountID)
 
 	resp, err := qc.httpClient.Do(req)
 	if err != nil {

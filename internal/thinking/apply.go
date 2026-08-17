@@ -162,8 +162,10 @@ func budgetToLevel(budget int) string {
 		return "medium"
 	case budget <= 24576:
 		return "high"
-	default:
+	case budget <= 32768:
 		return "xhigh"
+	default:
+		return "max"
 	}
 }
 

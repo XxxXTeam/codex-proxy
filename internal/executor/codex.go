@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"codex-proxy/internal/auth"
+	codexmeta "codex-proxy/internal/auth/codex"
 	"codex-proxy/internal/netutil"
 	"codex-proxy/internal/thinking"
 	"codex-proxy/internal/translator"
@@ -27,13 +28,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-)
-
-/* Codex 客户端版本常量，用于请求头 */
-const (
-	codexClientVersion = "0.125.0"
-	codexUserAgent     = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
-	codexOriginator    = "codex-tui"
 )
 
 /* 预分配 SSE 输出字节片段，避免每次事件的内存分配 */
@@ -1229,25 +1223,16 @@ func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, re
  */
 func applyCodexHeaders(r *http.Request, account *auth.Account, stream bool) {
 	token := account.GetAccessToken()
+	codexmeta.ApplyClientHeaders(r.Header, account.GetAccountID())
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+token)
-	r.Header.Set("Version", codexClientVersion)
 	r.Header.Set("Session_id", uuid.NewString())
-	r.Header.Set("User-Agent", codexUserAgent)
-	r.Header.Set("Origin", "https://chatgpt.com")
-	r.Header.Set("Referer", "https://chatgpt.com/")
-	r.Header.Set("Originator", codexOriginator)
 	r.Header.Set("Connection", "Keep-Alive")
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
 		r.Header.Set("Accept", "application/json")
-	}
-
-	accountID := account.GetAccountID()
-	if accountID != "" {
-		r.Header.Set("Chatgpt-Account-Id", accountID)
 	}
 }
 
@@ -1496,7 +1481,7 @@ func (e *Executor) pingUpstream(targetURL string) {
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", codexUserAgent)
+	codexmeta.ApplyClientHeaders(req.Header, "")
 	req.Header.Set("Connection", "Keep-Alive")
 
 	resp, err := e.httpClient.Do(req)

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"codex-proxy/internal/auth"
+	codexcatalog "codex-proxy/internal/codexcatalog"
 	"codex-proxy/internal/config"
 	codexdb "codex-proxy/internal/db"
 	"codex-proxy/internal/executor"
@@ -212,6 +213,7 @@ func main() {
 	/* 启动后台任务 */
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	codexcatalog.StartAutoRefresh(ctx)
 
 	if cfg.StartupAsyncLoad {
 		log.Infof("启动即服务可用: 已启用后台账号加载模式")

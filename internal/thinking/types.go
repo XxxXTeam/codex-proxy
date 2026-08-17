@@ -53,6 +53,7 @@ const (
 	LevelHigh    ThinkingLevel = "high"
 	LevelXHigh   ThinkingLevel = "xhigh"
 	LevelMax     ThinkingLevel = "max"
+	LevelUltra   ThinkingLevel = "ultra"
 )
 
 /**
