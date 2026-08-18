@@ -146,6 +146,10 @@ type Config struct {
 	/* DebugWSStream 为 true 时 WS 转发每帧都打 Debug 日志，排障时短期开启 */
 	DebugWSStream bool `yaml:"debug-ws-stream"`
 
+	/* CacheSpoofEnabled 开启缓存写入读取伪造：当上游返回了 cache_read 但未返回 cache_write 时，
+	 * 将首次主请求的 input_tokens 全部改为 cache_write，后续请求维持 cache_read + cache_write 为 input_tokens 的 99% */
+	CacheSpoofEnabled bool `yaml:"cache-spoof-enabled"`
+
 	/* Enable429ConcurrentRetry 显式开启：遇到 429 时并发用多个账号同时重试，首个成功响应返回客户端 */
 	Enable429ConcurrentRetry bool `yaml:"enable-429-concurrent-retry"`
 	/* ConcurrentRetry429TimeoutSec 并发重试最大等待时间（秒），0 表示默认 30 秒 */

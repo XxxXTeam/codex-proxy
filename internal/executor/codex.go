@@ -6,6 +6,7 @@
 package executor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -190,6 +191,8 @@ type RetryConfig struct {
 	ConcurrentRetry429Timeout time.Duration
 	/* PickIgnoringCooldownFn 忽略冷却状态的选号函数，用于并发重试时取回冷却中的账号 */
 	PickIgnoringCooldownFn func(model string, excluded map[string]bool) (*auth.Account, error)
+	/* CacheSpoofEnabled 缓存写入读取伪造：上游返回 cache_read 但无 cache_write 时按规则伪造 */
+	CacheSpoofEnabled bool
 }
 
 /**
@@ -786,10 +789,8 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
 	startTotal := time.Now()
 	convertStart := time.Now()
-	body, baseModel, isImage := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true, isImage)
+	_, baseModel, _ := thinking.ApplyThinking(requestBody, model)
 	convertDur := time.Since(convertStart)
-	apiURL := e.baseURL + "/responses"
 	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
 	emptyRetryMax := rc.EmptyRetryMax
 	if emptyRetryMax < 0 {
@@ -799,56 +800,104 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 
 	for emptyAttempt := 0; emptyAttempt <= emptyRetryMax; emptyAttempt++ {
 		rcExcl := MergeRetryConfigExcluded(rc, excludedForEmpty)
-		sendStart := time.Now()
-		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
-		sendDur := time.Since(sendStart)
+		/* 使用流方式打开上游连接，逐行读取 SSE 事件直至 response.completed */
+		s, err := e.OpenCodexResponsesStream(ctx, rcExcl, requestBody, model)
 		if err != nil {
 			return nil, err
 		}
+		sendDur := s.SendDur
 
-		data, readErr := io.ReadAll(httpResp.Body)
-		_ = httpResp.Body.Close()
+		/* 逐行读取 SSE 事件，收集所有 data 行，等待 response.completed */
+		//var allSSEBytes []byte
+		scanner := bufio.NewScanner(s.UpstreamBody())
+		scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
+		foundCompleted := false
+		var completedEventData []byte
+		var contentDelta strings.Builder
+		var reasoningDelta strings.Builder
 
-		var result []byte
-		gotValid := false
-		if completedEvent, ok := extractCompletedResponseEvent(data); ok {
-			resStr, hasOutput := translator.ConvertNonStreamResponse(completedEvent, reverseToolMap)
-			if hasOutput && resStr != "" {
-				usage := gjson.GetBytes(completedEvent, "response.usage")
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			jsonData := bytes.TrimSpace(line[5:])
+			eventType := gjson.GetBytes(jsonData, "type").String()
+
+			switch eventType {
+			case "response.output_text.delta":
+				contentDelta.WriteString(gjson.GetBytes(jsonData, "delta").String())
+			case "response.reasoning_summary_text.delta":
+				reasoningDelta.WriteString(gjson.GetBytes(jsonData, "delta").String())
+			case "response.reasoning.delta", "response.reasoning_text.delta":
+				reasoningDelta.WriteString(gjson.GetBytes(jsonData, "delta").String())
+			case "response.reasoning_text.done":
+				if t := gjson.GetBytes(jsonData, "text").String(); t != "" {
+					reasoningDelta.Reset()
+					reasoningDelta.WriteString(t)
+				}
+			case "response.completed":
+				completedEventData = make([]byte, len(jsonData))
+				copy(completedEventData, jsonData)
+				foundCompleted = true
+			}
+		}
+
+		_ = s.UpstreamBody().Close()
+		scanErr := scanner.Err()
+
+		if foundCompleted && len(completedEventData) > 0 {
+			resStr, _ := translator.ConvertNonStreamResponse(completedEventData, reverseToolMap)
+			/* 若 completed 事件的 output 数组为空但 delta 收集到了内容，手动填入 */
+			if contentDelta.Len() > 0 {
+				resStr, _ = sjson.Set(resStr, "choices.0.message.content", contentDelta.String())
+			}
+			if reasoningDelta.Len() > 0 {
+				resStr, _ = sjson.Set(resStr, "choices.0.message.reasoning_content", reasoningDelta.String())
+			}
+			if resStr != "" {
+				usage := gjson.GetBytes(completedEventData, "response.usage")
 				if usage.Exists() {
-					account.RecordUsageDetailed(
+					inputTokens := usage.Get("input_tokens").Int()
+					cacheRead := usage.Get("input_tokens_details.cached_tokens").Int()
+					cacheWrite := usageCacheWriteTokens(usage)
+					if rc.CacheSpoofEnabled {
+						translator.ApplyCacheSpoof(inputTokens, &cacheRead, &cacheWrite)
+						resStr, _ = sjson.Set(resStr, "usage.prompt_tokens_details.cached_tokens", cacheRead)
+						resStr, _ = sjson.Set(resStr, "usage.prompt_tokens_details.cache_write_tokens", cacheWrite)
+					}
+					s.Account().RecordUsageDetailed(
 						baseModel,
-						usage.Get("input_tokens").Int(),
+						inputTokens,
 						usage.Get("output_tokens").Int(),
 						usage.Get("total_tokens").Int(),
-						usage.Get("input_tokens_details.cached_tokens").Int(),
-						usageCacheWriteTokens(usage),
+						cacheRead,
+						cacheWrite,
 						usage.Get("output_tokens_details.reasoning_tokens").Int(),
 					)
 				}
-				result = []byte(resStr)
-				gotValid = true
+				s.Account().RecordSuccess()
+				log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, s.Account().GetEmail(), s.Attempts, convertDur, sendDur, time.Since(startTotal))
+				return []byte(resStr), nil
 			}
 		}
 
-		if gotValid && len(result) > 0 {
-			account.RecordSuccess()
-			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-			return result, nil
-		}
-		/* 空回答或读错误时标记账号失败，防止下一个请求继续选择该账号 */
-		account.RecordFailure()
-		excludedForEmpty[account.FilePath] = true
-		if readErr != nil {
-			if isRetryableUpstreamReadErr(readErr) && emptyAttempt < emptyRetryMax {
-				log.Warnf("nonstream 读取上游失败，换号重试 (%d/%d) account=%s: %v", emptyAttempt+1, emptyRetryMax+1, account.GetEmail(), wrapReadErr(readErr))
+		/* 空回答或读错误时标记账号失败 */
+		s.Account().RecordFailure()
+		excludedForEmpty[s.Account().FilePath] = true
+		if scanErr != nil {
+			if errors.Is(scanErr, context.Canceled) {
+				return nil, fmt.Errorf("读取流式响应中断: %w", scanErr)
+			}
+			if isRetryableUpstreamReadErr(scanErr) && emptyAttempt < emptyRetryMax {
+				log.Warnf("nonstream 读取上游失败，换号重试 (%d/%d) account=%s: %v", emptyAttempt+1, emptyRetryMax+1, s.Account().GetEmail(), wrapReadErr(scanErr))
 				continue
 			}
-			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-			return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(readErr))
+			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, s.Account().GetEmail(), s.Attempts, convertDur, sendDur, time.Since(startTotal))
+			return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(scanErr))
 		}
 		if emptyAttempt < emptyRetryMax {
-			log.Warnf("非流式空返回，换号重试 (account=%s attempt=%d/%d)", account.GetEmail(), emptyAttempt+1, emptyRetryMax+1)
+			log.Warnf("非流式空返回，换号重试 (account=%s attempt=%d/%d)", s.Account().GetEmail(), emptyAttempt+1, emptyRetryMax+1)
 		}
 	}
 	log.Infof("req summary nonstream (empty after %d tries) total=%v", emptyRetryMax+1, time.Since(startTotal))
@@ -918,6 +967,7 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 			return nil, ctx.Err()
 		}
 		rcExcl := MergeRetryConfigExcluded(rc, excluded)
+		/* 始终以 stream=true 发送上游，接收 SSE 后提取 response.completed 事件 */
 		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
 		if err != nil {
 			return nil, err
@@ -930,13 +980,21 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 		if resp, ok := extractCompletedResponseObject(data); ok {
 			usage := gjson.GetBytes(resp, "usage")
 			if usage.Exists() {
+				inputTokens := usage.Get("input_tokens").Int()
+				cacheRead := usage.Get("input_tokens_details.cached_tokens").Int()
+				cacheWrite := usageCacheWriteTokens(usage)
+				if rc.CacheSpoofEnabled {
+					translator.ApplyCacheSpoof(inputTokens, &cacheRead, &cacheWrite)
+					resp, _ = sjson.SetBytes(resp, "usage.input_tokens_details.cached_tokens", cacheRead)
+					resp, _ = sjson.SetBytes(resp, "usage.input_tokens_details.cache_write_tokens", cacheWrite)
+				}
 				account.RecordUsageDetailed(
 					baseModel,
-					usage.Get("input_tokens").Int(),
+					inputTokens,
 					usage.Get("output_tokens").Int(),
 					usage.Get("total_tokens").Int(),
-					usage.Get("input_tokens_details.cached_tokens").Int(),
-					usageCacheWriteTokens(usage),
+					cacheRead,
+					cacheWrite,
 					usage.Get("output_tokens_details.reasoning_tokens").Int(),
 				)
 			}
@@ -1121,7 +1179,7 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 	apiURL := e.baseURL + "/responses/compact"
 
 	sendStart := time.Now()
-	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, false)
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1136,7 +1194,7 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 		return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(err))
 	}
 
-	recordCompactUsage(account, baseModel, data)
+	data = recordCompactUsage(account, baseModel, data, rc.CacheSpoofEnabled)
 	account.RecordSuccess()
 	log.Infof("req summary responses-compact-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return data, nil
@@ -1168,26 +1226,39 @@ func (e *Executor) OpenCodexCompactStream(ctx context.Context, rc RetryConfig, r
  * recordCompactUsage records token usage from a Compact response.
  * Compact non-stream responses use top-level usage; wrapped responses are also supported.
  */
-func recordCompactUsage(account *auth.Account, model string, body []byte) {
+func recordCompactUsage(account *auth.Account, model string, body []byte, cacheSpoofEnabled bool) []byte {
 	if account == nil {
-		return
+		return body
 	}
 	usage := gjson.GetBytes(body, "usage")
 	if !usage.Exists() {
 		usage = gjson.GetBytes(body, "response.usage")
 	}
 	if !usage.Exists() || !usage.IsObject() {
-		return
+		return body
 	}
+
+	inputTokens := usage.Get("input_tokens").Int()
+	cacheRead := usage.Get("input_tokens_details.cached_tokens").Int()
+	cacheWrite := usageCacheWriteTokens(usage)
+
+	if cacheSpoofEnabled {
+		translator.ApplyCacheSpoof(inputTokens, &cacheRead, &cacheWrite)
+		/* 将伪造后的值写回请求体 */
+		body, _ = sjson.SetBytes(body, "usage.input_tokens_details.cached_tokens", cacheRead)
+		body, _ = sjson.SetBytes(body, "usage.input_tokens_details.cache_write_tokens", cacheWrite)
+	}
+
 	account.RecordUsageDetailed(
 		model,
-		usage.Get("input_tokens").Int(),
+		inputTokens,
 		usage.Get("output_tokens").Int(),
 		usage.Get("total_tokens").Int(),
-		usage.Get("input_tokens_details.cached_tokens").Int(),
-		usageCacheWriteTokens(usage),
+		cacheRead,
+		cacheWrite,
 		usage.Get("output_tokens_details.reasoning_tokens").Int(),
 	)
+	return body
 }
 
 /**

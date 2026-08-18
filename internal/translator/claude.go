@@ -341,7 +341,7 @@ func NewClaudeStreamState(model string) *ClaudeStreamState {
  * @param state - Claude 流式状态对象
  * @returns []string - "event: xxx\ndata: {...}\n\n" 格式的 SSE 事件列表
  */
-func ConvertCodexStreamToClaudeEvents(rawLine []byte, state *ClaudeStreamState) []string {
+func ConvertCodexStreamToClaudeEvents(rawLine []byte, state *ClaudeStreamState, cacheSpoofEnabled bool) []string {
 	if !bytes.HasPrefix(rawLine, dataPrefix) {
 		return nil
 	}
@@ -522,6 +522,9 @@ func ConvertCodexStreamToClaudeEvents(rawLine []byte, state *ClaudeStreamState) 
 			state.CacheReadTokens = usage.Get("input_tokens_details.cached_tokens").Int()
 			state.CacheWriteTokens = claudeUsageCacheWriteTokens(usage)
 			state.ReasoningTokens = claudeUsageReasoningTokens(usage)
+			if cacheSpoofEnabled {
+				ApplyCacheSpoof(state.InputTokens, &state.CacheReadTokens, &state.CacheWriteTokens)
+			}
 		}
 		if state.InThinkingBlock {
 			blockStop := `{}`
@@ -746,7 +749,7 @@ type ClaudeNonStreamResult struct {
 	ReasoningTokens  int64
 }
 
-func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byte, model string) ClaudeNonStreamResult {
+func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byte, model string, cacheSpoofEnabled bool) ClaudeNonStreamResult {
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -783,7 +786,7 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
 		}
 
 		usage := gjson.GetBytes(jsonData, "response.usage")
-		return ClaudeNonStreamResult{
+		result := ClaudeNonStreamResult{
 			JSON:             ConvertCodexNonStreamToClaudeResponse(jsonData, model),
 			FoundCompleted:   true,
 			HasText:          hasText,
@@ -796,6 +799,12 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
 			CacheWriteTokens: claudeUsageCacheWriteTokens(usage),
 			ReasoningTokens:  claudeUsageReasoningTokens(usage),
 		}
+		if cacheSpoofEnabled {
+			ApplyCacheSpoof(result.InputTokens, &result.CacheReadTokens, &result.CacheWriteTokens)
+			result.JSON, _ = sjson.Set(result.JSON, "usage.cache_read_input_tokens", result.CacheReadTokens)
+			result.JSON, _ = sjson.Set(result.JSON, "usage.cache_creation_input_tokens", result.CacheWriteTokens)
+		}
+		return result
 	}
 	return ClaudeNonStreamResult{}
 }
@@ -810,7 +819,7 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
  * @returns string - Claude Messages API 格式的 JSON 字符串
  */
 func ConvertCodexFullSSEToClaudeResponse(ctx context.Context, data []byte, model string) string {
-	return ConvertCodexFullSSEToClaudeResponseWithMeta(ctx, data, model).JSON
+	return ConvertCodexFullSSEToClaudeResponseWithMeta(ctx, data, model, false).JSON
 }
 
 /**

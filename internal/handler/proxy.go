@@ -24,6 +24,7 @@ import (
 	"codex-proxy/internal/codexcatalog"
 	"codex-proxy/internal/executor"
 	"codex-proxy/internal/thinking"
+	"codex-proxy/internal/translator"
 
 	fasthttprouter "github.com/fasthttp/router"
 	"github.com/fasthttp/websocket"
@@ -87,6 +88,7 @@ type ProxyHandler struct {
 	debugWSStream             bool          /* WS 转发时是否打印每帧 debug 日志 */
 	concurrentRetry429        bool          /* 遇 429 时并发重试 */
 	concurrentRetry429Timeout time.Duration /* 并发重试最大等待时间 */
+	cacheSpoofEnabled         bool          /* 缓存写入读取伪造：上游返回 cache_read 但无 cache_write 时按规则伪造 */
 	auth401RecoverTracks      sync.Map      /* key: filePath, value: *auth401RecoverTrack */
 	/* retryCfg 在首请求时构建一次，避免每条对话重复分配闭包与 RetryConfig */
 	retryCfgOnce sync.Once
@@ -112,7 +114,7 @@ type auth401RecoverTrack struct {
  * @param debugUpstreamStream - 是否 Info 打印上游 Codex SSE 原文（对应配置 debug-upstream-stream）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableModelImage bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, staticAssets fs.FS) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableModelImage bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, cacheSpoofEnabled bool, staticAssets fs.FS) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -122,7 +124,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 	if quotaChecker == nil {
 		quotaChecker = auth.NewQuotaChecker(baseURL, proxyURL, quotaCheckConcurrency, enableHTTP2, backendDomain, backendResolveAddress, time.Duration(quotaCheckCacheTTLSec)*time.Second)
 	}
-	return &ProxyHandler{
+	h := &ProxyHandler{
 		manager:             manager,
 		executor:            exec,
 		apiKeys:             apiKeys,
@@ -139,6 +141,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		enableWebSocket:     enableWebSocket,
 		debugWSStream:       debugWSStream,
 		concurrentRetry429:  concurrentRetry429,
+		cacheSpoofEnabled:  cacheSpoofEnabled,
 		concurrentRetry429Timeout: func() time.Duration {
 			if concurrentRetry429TimeoutSec > 0 {
 				return time.Duration(concurrentRetry429TimeoutSec) * time.Second
@@ -146,6 +149,10 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 			return 30 * time.Second
 		}(),
 	}
+
+	/* 设置全局缓存伪造开关 */
+	translator.SetCacheSpoofEnabled(cacheSpoofEnabled)
+	return h
 }
 
 /**
@@ -586,6 +593,7 @@ func (h *ProxyHandler) buildRetryConfigOnce() executor.RetryConfig {
 		PickIgnoringCooldownFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
 			return h.manager.PickIgnoringCooldown(model, excluded)
 		},
+		CacheSpoofEnabled: h.cacheSpoofEnabled,
 	}
 	if h.quotaPrecheck && h.quotaChecker != nil {
 		rc.QuotaCheckFn = func(ctx context.Context, acc *auth.Account) bool {

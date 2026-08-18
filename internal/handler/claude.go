@@ -41,7 +41,7 @@ func pumpClaudeCodexSSE(s *executor.CodexResponsesStream, w io.Writer, flush fun
 			}
 			executor.LogUpstreamStreamChunk("claude_sse_line", model, ae, line)
 		}
-		events := translator.ConvertCodexStreamToClaudeEvents(line, state)
+		events := translator.ConvertCodexStreamToClaudeEvents(line, state, s.CacheSpoofEnabled())
 		for _, event := range events {
 			_, _ = io.WriteString(w, event)
 			if flush != nil {
@@ -261,7 +261,7 @@ func (h *ProxyHandler) executeClaudeNonStream(ctx *fasthttp.RequestCtx, rc execu
 		return fmt.Errorf("读取响应失败: %w", err)
 	}
 
-	result := translator.ConvertCodexFullSSEToClaudeResponseWithMeta(ctx, data, model)
+	result := translator.ConvertCodexFullSSEToClaudeResponseWithMeta(ctx, data, model, h.cacheSpoofEnabled)
 	if !result.FoundCompleted || result.JSON == "" {
 		return fmt.Errorf("未收到 response.completed 事件")
 	}

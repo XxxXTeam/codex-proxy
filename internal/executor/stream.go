@@ -40,6 +40,8 @@ type CodexResponsesStream struct {
 	reopenFn func(ctx context.Context) (io.ReadCloser, CodexResponsesMeta, error)
 	/* debugUpstreamStream 为 true 时 Info 打印上游原始 SSE（配置 debug-upstream-stream） */
 	debugUpstreamStream bool
+	/* cacheSpoofEnabled 缓存写入读取伪造：上游返回 cache_read 但无 cache_write 时按规则伪造 */
+	cacheSpoofEnabled bool
 }
 
 /* Body 返回当前上游响应体，供外部 pump 读取 SSE */
@@ -47,6 +49,9 @@ func (s *CodexResponsesStream) Body() io.ReadCloser { return s.body }
 
 /* Account 返回当前关联的账号 */
 func (s *CodexResponsesStream) Account() *auth.Account { return s.account }
+
+/* CacheSpoofEnabled 返回是否启用缓存写入读取伪造 */
+func (s *CodexResponsesStream) CacheSpoofEnabled() bool { return s.cacheSpoofEnabled }
 
 // CodexResponsesMeta bundles metadata returned by openCodexResponsesBody.
 type CodexResponsesMeta struct {
@@ -257,6 +262,7 @@ func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig,
 		pumpRounds:          codexStreamPumpRounds(rc.MaxRetry),
 		reopenExcluded:      make(map[string]bool),
 		debugUpstreamStream: rc.DebugUpstreamStream,
+			cacheSpoofEnabled:   rc.CacheSpoofEnabled,
 	}
 	s.reopenFn = func(ctx context.Context) (io.ReadCloser, CodexResponsesMeta, error) {
 		rcEx := MergeRetryConfigExcluded(rc, s.reopenExcluded)
@@ -458,6 +464,10 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 		if flush != nil {
 			flush()
 		}
+	}
+
+	if s.cacheSpoofEnabled && (state.UsageInput > 0 || state.UsageOutput > 0) {
+		translator.ApplyCacheSpoof(state.UsageInput, &state.UsageCacheRead, &state.UsageCacheWrite)
 	}
 
 	if s.IncludeUsage {

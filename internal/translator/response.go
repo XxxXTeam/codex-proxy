@@ -501,6 +501,12 @@ func BuildChatCompletionStreamUsageOnlyChunk(state *StreamState) string {
 	chunk, _ = sjson.Set(chunk, "usage.prompt_tokens", prompt)
 	chunk, _ = sjson.Set(chunk, "usage.completion_tokens", completion)
 	chunk, _ = sjson.Set(chunk, "usage.total_tokens", total)
+	if state.UsageCacheRead > 0 {
+		chunk, _ = sjson.Set(chunk, "usage.prompt_tokens_details.cached_tokens", state.UsageCacheRead)
+	}
+	if state.UsageCacheWrite > 0 {
+		chunk, _ = sjson.Set(chunk, "usage.prompt_tokens_details.cache_write_tokens", state.UsageCacheWrite)
+	}
 	return chunk
 }
 
@@ -543,9 +549,16 @@ func ConvertNonStreamResponse(rawJSON []byte, reverseToolMap map[string]string) 
 		if v := usage.Get("input_tokens"); v.Exists() {
 			tpl, _ = sjson.Set(tpl, "usage.prompt_tokens", v.Int())
 		}
-		/* 透传 cached_tokens 和 reasoning_tokens 细分信息（issue #391） */
+		/* 透传 cached_tokens、cache_write_tokens 和 reasoning_tokens 细分信息 */
 		if v := usage.Get("input_tokens_details.cached_tokens"); v.Exists() {
 			tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cached_tokens", v.Int())
+		}
+		if v := usage.Get("input_tokens_details.cache_write_tokens"); v.Exists() {
+			tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cache_write_tokens", v.Int())
+		} else if v := usage.Get("cache_write_tokens"); v.Exists() {
+			tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cache_write_tokens", v.Int())
+		} else if v := usage.Get("cache_creation_input_tokens"); v.Exists() {
+			tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cache_write_tokens", v.Int())
 		}
 		if v := usage.Get("output_tokens_details.reasoning_tokens"); v.Exists() {
 			tpl, _ = sjson.Set(tpl, "usage.completion_tokens_details.reasoning_tokens", v.Int())

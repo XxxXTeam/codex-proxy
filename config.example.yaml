@@ -236,6 +236,10 @@ max-idle-conns-per-host: 512
 # 是否启用出站 HTTP/2（关闭则强制 HTTP/1.1，多连接并行通常更稳）
 enable-http2: false
 
+# 缓存写入读取伪造：上游返回了 cache_read 但没有 cache_write 时，
+# 首次主请求将 input_tokens 全部改为 cache_write，后续请求维持 cache_read + cache_write 为 input_tokens 的 99%
+# cache-spoof-enabled: false
+
 # 管理类 HTTP / WebSocket 接口（若配置了 api-keys 则需带相同 Key；详见 docs/API-ADMIN.md）:
 #   POST /recover-auth           — 401 恢复：同步刷新 token；刷新 429 时查额度；仍失败则凭据重命名为 *.json.disabled
 #     请求体: {"email":"a@b.com"} 或 {"file_path":"账号.json"} 或 {"all":true}
