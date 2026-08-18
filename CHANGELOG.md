@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.11.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.10.0...v1.11.0) (2026-08-18)
+
+
+### ✨ 新功能
+
+* 修复非流情况下的响应错误问题，新增了配置项，支持开启危险的缓存伪造功能 ([b75f627](https://github.com/XxxXTeam/codex-proxy/commit/b75f6277478787705f3398bb13651632bd01db18))
+
+
+### 🐛 错误修复
+
+* 修复 CI 工作流 - Dockerfile Go 版本和 setup-node 缓存问题 ([#66](https://github.com/XxxXTeam/codex-proxy/issues/66)) ([df7ff77](https://github.com/XxxXTeam/codex-proxy/commit/df7ff77b1ac21cac3156af7fe8bd2dcdcbbdad90))
+
 ## [1.10.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.9.0...v1.10.0) (2026-08-18)
 
 
