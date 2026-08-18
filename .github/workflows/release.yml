@@ -10,7 +10,6 @@ permissions:
   contents: write
   packages: write
   pull-requests: write
-  # BuildKit type=gha 缓存走 Actions Cache API；write 含读权限；不显式授权时 actions 为 none
   actions: write
 
 jobs:
@@ -57,14 +56,12 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.25.0"
+          go-version-file: go.mod
           cache: true
 
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: web/package-lock.json
 
       - name: 安装前端依赖
         working-directory: web
@@ -157,7 +154,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # 优先用 GHCR 专用缓存镜像（release 之间可复用）；ignore-error 避免首次无 buildcache 时拉取失败
           cache-from: |
             type=registry,ref=${{ steps.ghcr.outputs.image }}:buildcache,ignore-error=true
             type=gha,scope=codex-proxy-docker
