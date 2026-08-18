@@ -800,7 +800,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 	for emptyAttempt := 0; emptyAttempt <= emptyRetryMax; emptyAttempt++ {
 		rcExcl := MergeRetryConfigExcluded(rc, excludedForEmpty)
 		sendStart := time.Now()
-		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, false)
+		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
 		sendDur := time.Since(sendStart)
 		if err != nil {
 			return nil, err
@@ -918,7 +918,7 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 			return nil, ctx.Err()
 		}
 		rcExcl := MergeRetryConfigExcluded(rc, excluded)
-		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, false)
+		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
 		if err != nil {
 			return nil, err
 		}
