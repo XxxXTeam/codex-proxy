@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.10.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.9.0...v1.10.0) (2026-08-18)
+
+
+### ✨ 新功能
+
+* expand Codex compatibility and account console ([e100430](https://github.com/XxxXTeam/codex-proxy/commit/e10043096c28cd9f1f222b21c01570693f3212f3))
+* sync codex client headers and catalog ([a7531b3](https://github.com/XxxXTeam/codex-proxy/commit/a7531b31fefe21d4ca7f793713ce186c743b1bd9))
+* 支持非流请求 ([b49ed7c](https://github.com/XxxXTeam/codex-proxy/commit/b49ed7c3ce5eb275b7b6b656b02a8643e9334268))
+
+
+### 📦 依赖更新
+
+* **ci:** bump actions/checkout from 6 to 7 ([#53](https://github.com/XxxXTeam/codex-proxy/issues/53)) ([0011871](https://github.com/XxxXTeam/codex-proxy/commit/0011871fcb6a931a3bda89e2d14193b919443c1c))
+* **ci:** bump actions/setup-go from 6 to 7 ([#57](https://github.com/XxxXTeam/codex-proxy/issues/57)) ([fafea87](https://github.com/XxxXTeam/codex-proxy/commit/fafea879a74de73d521bbca06392fce88522479b))
+* **ci:** bump actions/setup-node from 6 to 7 ([#58](https://github.com/XxxXTeam/codex-proxy/issues/58)) ([23627ac](https://github.com/XxxXTeam/codex-proxy/commit/23627ac3b35b7024ac05b8787da9cabbfc410b27))
+
 ## [1.9.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.8.1...v1.9.0) (2026-06-26)
 
 
