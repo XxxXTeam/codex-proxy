@@ -31,6 +31,7 @@ type TokenData struct {
 	Email        string `json:"email"`
 	Expire       string `json:"expired"`
 	PlanType     string `json:"plan_type,omitempty"`
+	WebSockets   bool   `json:"websockets,omitempty"`
 }
 
 /**
@@ -56,6 +57,7 @@ type TokenFile struct {
 	Type        string `json:"type"`
 	Expire      string `json:"expired"`
 	PlanType    string `json:"plan_type,omitempty"`
+	WebSockets  bool   `json:"websockets,omitempty"`
 }
 
 /**
@@ -94,8 +96,12 @@ type Account struct {
 	TotalOutputTokens   atomic.Int64
 	TotalTokens         atomic.Int64
 	TotalCompletions    atomic.Int64
+	CacheReadTokens     atomic.Int64
+	CacheWriteTokens    atomic.Int64
+	ReasoningTokens     atomic.Int64
 	QuotaInfo           *QuotaInfo
 	QuotaCheckedAt      time.Time
+	usageByModel        map[string]UsageStats
 
 	/* 原子状态字段（热路径无锁读取） */
 	atomicStatus     atomic.Int32 /* 存储 AccountStatus 枚举值 */
@@ -194,24 +200,26 @@ type Auth401RecoverResult struct {
  * @field CooldownUntil - 冷却结束时间
  */
 type AccountStats struct {
-	AccountID           string     `json:"account_id,omitempty"`
-	Email               string     `json:"email"`
-	FilePath            string     `json:"file_path,omitempty"`
-	Status              string     `json:"status"`
-	PlanType            string     `json:"plan_type,omitempty"`
-	HasRefreshToken     bool       `json:"has_refresh_token"`
-	DisableReason       string     `json:"disable_reason,omitempty"`
-	TotalRequests       int64      `json:"total_requests"`
-	TotalErrors         int64      `json:"total_errors"`
-	ConsecutiveFailures int        `json:"consecutive_failures"`
-	LastUsedAt          time.Time  `json:"last_used_at,omitempty"`
-	LastRefreshedAt     time.Time  `json:"last_refreshed_at,omitempty"`
-	CooldownUntil       time.Time  `json:"cooldown_until,omitempty"`
-	QuotaExhausted      bool       `json:"quota_exhausted"`
-	QuotaResetsAt       time.Time  `json:"quota_resets_at,omitempty"`
-	TokenExpire         string     `json:"token_expire,omitempty"`
-	Usage               UsageStats `json:"usage"`
-	Quota               *QuotaInfo `json:"quota,omitempty"`
+	AccountID           string                `json:"account_id,omitempty"`
+	Email               string                `json:"email"`
+	FilePath            string                `json:"file_path,omitempty"`
+	Status              string                `json:"status"`
+	PlanType            string                `json:"plan_type,omitempty"`
+	HasRefreshToken     bool                  `json:"has_refresh_token"`
+	WebSockets          bool                  `json:"websockets"`
+	DisableReason       string                `json:"disable_reason,omitempty"`
+	TotalRequests       int64                 `json:"total_requests"`
+	TotalErrors         int64                 `json:"total_errors"`
+	ConsecutiveFailures int                   `json:"consecutive_failures"`
+	LastUsedAt          time.Time             `json:"last_used_at,omitempty"`
+	LastRefreshedAt     time.Time             `json:"last_refreshed_at,omitempty"`
+	CooldownUntil       time.Time             `json:"cooldown_until,omitempty"`
+	QuotaExhausted      bool                  `json:"quota_exhausted"`
+	QuotaResetsAt       time.Time             `json:"quota_resets_at,omitempty"`
+	TokenExpire         string                `json:"token_expire,omitempty"`
+	Usage               UsageStats            `json:"usage"`
+	UsageByModel        map[string]UsageStats `json:"usage_by_model,omitempty"`
+	Quota               *QuotaInfo            `json:"quota,omitempty"`
 }
 
 /**
@@ -226,6 +234,25 @@ type UsageStats struct {
 	InputTokens      int64 `json:"input_tokens"`
 	OutputTokens     int64 `json:"output_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+}
+
+/**
+ * UsageByModel 返回按基础模型聚合的 token 使用量快照。
+ */
+func (a *Account) UsageByModel() map[string]UsageStats {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	result := make(map[string]UsageStats, len(a.usageByModel))
+	for model, usage := range a.usageByModel {
+		result[model] = usage
+	}
+	return result
 }
 
 /**
@@ -339,6 +366,12 @@ func (a *Account) UpdateToken(td TokenData) {
 	}
 	if td.IDToken == "" {
 		td.IDToken = prev.IDToken
+	}
+	if strings.TrimSpace(td.PlanType) == "" {
+		td.PlanType = prev.PlanType
+	}
+	if !td.WebSockets {
+		td.WebSockets = prev.WebSockets
 	}
 	var expMs int64
 	if td.Expire != "" {
@@ -511,6 +544,58 @@ func (a *Account) RecordUsage(inputTokens, outputTokens, totalTokens int64) {
 }
 
 /**
+ * RecordUsageDetailed 记录包含缓存和推理分项的请求用量。
+ */
+func (a *Account) RecordUsageDetailed(model string, inputTokens, outputTokens, totalTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens int64) {
+	a.RecordUsageForModel(model, inputTokens, outputTokens, totalTokens)
+	if cacheReadTokens > 0 {
+		a.CacheReadTokens.Add(cacheReadTokens)
+	}
+	if cacheWriteTokens > 0 {
+		a.CacheWriteTokens.Add(cacheWriteTokens)
+	}
+	if reasoningTokens > 0 {
+		a.ReasoningTokens.Add(reasoningTokens)
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	a.mu.Lock()
+	usage := a.usageByModel[model]
+	usage.CacheReadTokens += cacheReadTokens
+	usage.CacheWriteTokens += cacheWriteTokens
+	usage.ReasoningTokens += reasoningTokens
+	a.usageByModel[model] = usage
+	a.mu.Unlock()
+}
+
+/**
+ * RecordUsageForModel 记录请求用量，并按基础模型保留可计价的分项统计。
+ */
+func (a *Account) RecordUsageForModel(model string, inputTokens, outputTokens, totalTokens int64) {
+	a.RecordUsage(inputTokens, outputTokens, totalTokens)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	if totalTokens <= 0 {
+		totalTokens = inputTokens + outputTokens
+	}
+	a.mu.Lock()
+	if a.usageByModel == nil {
+		a.usageByModel = make(map[string]UsageStats)
+	}
+	usage := a.usageByModel[model]
+	usage.TotalCompletions++
+	usage.InputTokens += inputTokens
+	usage.OutputTokens += outputTokens
+	usage.TotalTokens += totalTokens
+	a.usageByModel[model] = usage
+	a.mu.Unlock()
+}
+
+/**
  * GetUsedPercent 获取账号的额度使用率百分比
  * 从 QuotaInfo.RawData 中提取 rate_limit.primary_window.used_percent
  * 未查询过额度的账号返回 -1（排到最后）
@@ -589,6 +674,11 @@ func (a *Account) GetStats() AccountStats {
 		quotaExhausted = false
 	}
 
+	usageByModel := make(map[string]UsageStats, len(a.usageByModel))
+	for model, usage := range a.usageByModel {
+		usageByModel[model] = usage
+	}
+
 	return AccountStats{
 		AccountID:           a.Token.AccountID,
 		Email:               a.Token.Email,
@@ -596,6 +686,7 @@ func (a *Account) GetStats() AccountStats {
 		Status:              statusStr,
 		PlanType:            a.Token.PlanType,
 		HasRefreshToken:     strings.TrimSpace(a.Token.RefreshToken) != "",
+		WebSockets:          a.Token.WebSockets,
 		DisableReason:       a.DisableReason,
 		TotalRequests:       a.TotalRequests.Load(),
 		TotalErrors:         a.TotalErrors.Load(),
@@ -611,7 +702,11 @@ func (a *Account) GetStats() AccountStats {
 			InputTokens:      a.TotalInputTokens.Load(),
 			OutputTokens:     a.TotalOutputTokens.Load(),
 			TotalTokens:      a.TotalTokens.Load(),
+			CacheReadTokens:  a.CacheReadTokens.Load(),
+			CacheWriteTokens: a.CacheWriteTokens.Load(),
+			ReasoningTokens:  a.ReasoningTokens.Load(),
 		},
-		Quota: a.QuotaInfo,
+		UsageByModel: usageByModel,
+		Quota:        a.QuotaInfo,
 	}
 }

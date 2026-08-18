@@ -49,7 +49,7 @@ function probeBadgeLabel(status: AccountProbeResult["status"]) {
 function LoadingRows() {
   return Array.from({ length: 6 }, (_, index) => (
     <TableRow key={index}>
-      <TableCell colSpan={9}>
+      <TableCell colSpan={11}>
         <Skeleton className="h-8 w-full" />
       </TableCell>
     </TableRow>
@@ -112,6 +112,94 @@ function QuotaCheckSummary({
       {result.message ? (
         <div className="line-clamp-2 text-muted-foreground">{result.message}</div>
       ) : null}
+    </div>
+  )
+}
+
+function AccountRuntimeDetails({ account }: { account: AccountStats }) {
+  const quotaStatus = account.quota
+    ? account.quota.valid
+      ? `有效${account.quota.status_code > 0 ? ` · HTTP ${account.quota.status_code}` : ""}`
+      : `无效${account.quota.status_code > 0 ? ` · HTTP ${account.quota.status_code}` : ""}`
+    : "未检查"
+
+  return (
+    <div className="grid grid-cols-2 gap-x-3 gap-y-2 rounded-lg border bg-background p-2 text-xs">
+      <div>
+        <div className="text-muted-foreground">Token 过期</div>
+        <div className="mt-1 font-medium">{formatDateTime(account.token_expire)}</div>
+      </div>
+      <div>
+        <div className="text-muted-foreground">最近刷新</div>
+        <div className="mt-1 font-medium">{formatDateTime(account.last_refreshed_at)}</div>
+      </div>
+      <div>
+        <div className="text-muted-foreground">冷却截止</div>
+        <div className="mt-1 font-medium">{formatDateTime(account.cooldown_until)}</div>
+      </div>
+      <div>
+        <div className="text-muted-foreground">连续失败</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.consecutive_failures)}
+        </div>
+      </div>
+      <div>
+        <div className="text-muted-foreground">额度状态</div>
+        <div className="mt-1 font-medium">{quotaStatus}</div>
+      </div>
+      <div>
+        <div className="text-muted-foreground">额度检查</div>
+        <div className="mt-1 font-medium">{formatDateTime(account.quota?.checked_at)}</div>
+      </div>
+    </div>
+  )
+}
+
+function UsageSummary({ account }: { account: AccountStats }) {
+  return (
+    <div className="grid grid-cols-2 gap-2 text-xs">
+      <div className="rounded-lg bg-muted p-2">
+        <div className="text-muted-foreground">完成次数</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.usage.total_completions)}
+        </div>
+      </div>
+      <div className="rounded-lg bg-muted p-2">
+        <div className="text-muted-foreground">输入 token</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.usage.input_tokens)}
+        </div>
+      </div>
+      <div className="rounded-lg bg-muted p-2">
+        <div className="text-muted-foreground">输出 token</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.usage.output_tokens)}
+        </div>
+      </div>
+      <div className="rounded-lg bg-muted p-2">
+        <div className="text-muted-foreground">总 token</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.usage.total_tokens)}
+        </div>
+      </div>
+      <div className="rounded-lg bg-muted p-2">
+        <div className="text-muted-foreground">缓存读取</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.usage.cache_read_tokens)}
+        </div>
+      </div>
+      <div className="rounded-lg bg-muted p-2">
+        <div className="text-muted-foreground">缓存写入</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.usage.cache_write_tokens)}
+        </div>
+      </div>
+      <div className="rounded-lg bg-muted p-2">
+        <div className="text-muted-foreground">推理 token</div>
+        <div className="mt-1 font-mono font-medium">
+          {formatNumber(account.usage.reasoning_tokens)}
+        </div>
+      </div>
     </div>
   )
 }
@@ -202,6 +290,8 @@ export function AccountTable({
                 <TableHead>错误</TableHead>
                 <TableHead>最后使用</TableHead>
                 <TableHead>额度检查</TableHead>
+                <TableHead>运行信息</TableHead>
+                <TableHead>Token 用量</TableHead>
                 <TableHead>操作</TableHead>
               </TableRow>
             </TableHeader>
@@ -267,8 +357,9 @@ export function AccountTable({
 
               <QuotaWindows account={account} quota={displayedQuota} />
               <QuotaCheckSummary result={probe} />
+              <AccountRuntimeDetails account={account} />
 
-              <div className="grid grid-cols-3 gap-2 text-xs">
+              <div className="grid grid-cols-4 gap-2 text-xs">
                 <div className="rounded-lg bg-muted p-2">
                   <div className="text-muted-foreground">请求</div>
                   <div className="mt-1 font-mono font-medium">
@@ -287,7 +378,14 @@ export function AccountTable({
                     {formatDate(displayedQuota?.checked_at)}
                   </div>
                 </div>
+                <div className="rounded-lg bg-muted p-2">
+                  <div className="text-muted-foreground">连续失败</div>
+                  <div className="mt-1 font-mono font-medium">
+                    {formatNumber(account.consecutive_failures)}
+                  </div>
+                </div>
               </div>
+              <UsageSummary account={account} />
 
               <ProbeActions
                 account={account}
@@ -315,6 +413,7 @@ export function AccountTable({
               <TableHead>错误</TableHead>
               <TableHead>最后使用</TableHead>
               <TableHead>额度检查</TableHead>
+              <TableHead>Token 用量</TableHead>
               <TableHead>操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -364,7 +463,25 @@ export function AccountTable({
                     {formatNumber(account.total_errors)}
                   </TableCell>
                   <TableCell>{formatDate(account.last_used_at)}</TableCell>
-                  <TableCell>{formatDate(displayedQuota?.checked_at)}</TableCell>
+                  <TableCell>
+                    <div className="flex min-w-36 flex-col gap-1 text-xs">
+                      <span>刷新 {formatDate(account.last_refreshed_at)}</span>
+                      <span>过期 {formatDate(account.token_expire)}</span>
+                      <span>失败 {formatNumber(account.consecutive_failures)} 次</span>
+                      <span>冷却 {formatDate(account.cooldown_until)}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-32 flex-col gap-1 font-mono text-xs">
+                      <span>完成 {formatNumber(account.usage.total_completions)}</span>
+                      <span>输入 {formatNumber(account.usage.input_tokens)}</span>
+                      <span>输出 {formatNumber(account.usage.output_tokens)}</span>
+                      <span>总计 {formatNumber(account.usage.total_tokens)}</span>
+                      <span>缓存读 {formatNumber(account.usage.cache_read_tokens)}</span>
+                      <span>缓存写 {formatNumber(account.usage.cache_write_tokens)}</span>
+                      <span>推理 {formatNumber(account.usage.reasoning_tokens)}</span>
+                    </div>
+                  </TableCell>
                   <TableCell>
                     <ProbeActions
                       account={account}

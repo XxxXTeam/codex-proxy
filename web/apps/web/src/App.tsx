@@ -9,6 +9,7 @@ import {
 import {
   Activity,
   AlertCircle,
+  Boxes,
   KeyRound,
   Plus,
   RefreshCw,
@@ -53,6 +54,7 @@ import {
   isAuthError,
   loadCredentials,
   probeAccount,
+  refreshCatalog,
   runProgressStream,
   saveCredentials,
 } from "@/lib/api"
@@ -390,11 +392,13 @@ export function App() {
   const [editingAccount, setEditingAccount] = useState<AccountStats | null>(null)
   const [showEditor, setShowEditor] = useState(false)
   const [runningAction, setRunningAction] = useState<RunningAction>(null)
+  const [catalogRefreshing, setCatalogRefreshing] = useState(false)
   const [progressEvents, setProgressEvents] = useState<ProgressEvent[]>([])
   const [probeResults, setProbeResults] = useState<Record<string, AccountProbeResult>>({})
   const [probingKey, setProbingKey] = useState<string | null>(null)
   const [deletingKey, setDeletingKey] = useState<string | null>(null)
   const loadRequestId = useRef(0)
+  const editorRef = useRef<HTMLDivElement>(null)
 
   const loadStats = useCallback(
     async (signal?: AbortSignal) => {
@@ -434,6 +438,18 @@ export function App() {
     return () => controller.abort()
   }, [loadStats])
 
+  useEffect(() => {
+    if (!showEditor) return
+    editorRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [showEditor, editingAccount])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!runningAction) void loadStats()
+    }, 30_000)
+    return () => window.clearInterval(timer)
+  }, [loadStats, runningAction])
+
   const accounts = useMemo(() => stats?.accounts ?? [], [stats?.accounts])
   const filteredAccounts = useMemo(() => {
     if (tab === "all") return accounts
@@ -463,6 +479,22 @@ export function App() {
       if (isAuthError(caught)) setShowSettings(true)
     } finally {
       setRunningAction(null)
+    }
+  }
+
+  async function handleCatalogRefresh() {
+    setCatalogRefreshing(true)
+    setError("")
+    try {
+      const result = await refreshCatalog(credentials)
+      setStats((current) => (current ? { ...current, catalog: result.catalog } : current))
+      await loadStats()
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "模型目录刷新失败"
+      setError(message)
+      if (isAuthError(caught)) setShowSettings(true)
+    } finally {
+      setCatalogRefreshing(false)
     }
   }
 
@@ -535,8 +567,17 @@ export function App() {
               </Button>
               <Button
                 className="w-full sm:w-auto"
+                variant="outline"
+                onClick={() => void handleCatalogRefresh()}
+                disabled={loading || Boolean(runningAction) || catalogRefreshing}
+              >
+                <Boxes data-icon="inline-start" />
+                {catalogRefreshing ? "更新模型中" : "更新模型目录"}
+              </Button>
+              <Button
+                className="w-full sm:w-auto"
                 onClick={() => void runAction("quota")}
-                disabled={loading || Boolean(runningAction)}
+                disabled={loading || Boolean(runningAction) || catalogRefreshing}
               >
                 <ShieldCheck data-icon="inline-start" />
                 检查额度
@@ -601,15 +642,17 @@ export function App() {
           ) : null}
 
           {showEditor ? (
-            <AccountEditor
-              credentials={credentials}
-              account={editingAccount}
-              onClose={() => {
-                setShowEditor(false)
-                setEditingAccount(null)
-              }}
-              onSaved={() => void loadStats()}
-            />
+            <div ref={editorRef} className="scroll-mt-4">
+              <AccountEditor
+                credentials={credentials}
+                account={editingAccount}
+                onClose={() => {
+                  setShowEditor(false)
+                  setEditingAccount(null)
+                }}
+                onSaved={() => void loadStats()}
+              />
+            </div>
           ) : null}
 
           {error ? (
@@ -621,7 +664,11 @@ export function App() {
           ) : null}
 
           <ProgressPanel action={runningAction} events={progressEvents} />
-          <DashboardScreen stats={stats} />
+          <DashboardScreen
+            stats={stats}
+            onRefreshCatalog={() => void handleCatalogRefresh()}
+            catalogRefreshing={catalogRefreshing}
+          />
 
           <Card>
             <CardHeader className="gap-3">

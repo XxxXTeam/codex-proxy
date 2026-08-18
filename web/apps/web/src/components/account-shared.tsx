@@ -32,8 +32,11 @@ function quotaDetail(window: QuotaWindow) {
   if (window.remaining !== undefined) {
     parts.push(`剩余 ${formatNumber(window.remaining)}`)
   }
+  if (parts.length === 0 && window.usedPercent !== undefined) {
+    parts.push(`已使用 ${formatPercent(window.usedPercent)}`)
+  }
 
-  return parts.length > 0 ? parts.join("，") : "额度详情未知"
+  return parts.length > 0 ? parts.join("，") : "上游未返回绝对额度"
 }
 
 export function QuotaWindows({
@@ -75,7 +78,13 @@ export function QuotaWindows({
                 <span className="font-mono text-xs text-muted-foreground">
                   {window.label}
                 </span>
-                <Progress value={window.usedPercent ?? 0} />
+                {typeof window.usedPercent === "number" ? (
+                  <Progress value={window.usedPercent} />
+                ) : (
+                  <span className="text-center text-[0.68rem] text-muted-foreground">
+                    未返回使用率
+                  </span>
+                )}
                 <span className="text-right font-mono text-xs">
                   {formatPercent(window.usedPercent)}
                 </span>

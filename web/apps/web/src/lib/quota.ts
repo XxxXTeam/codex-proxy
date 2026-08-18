@@ -233,7 +233,21 @@ export function parseQuotaWindows(rawData: unknown): QuotaWindow[] {
 }
 
 export function primaryQuotaPercent(rawData: unknown) {
-  return parseQuotaWindows(rawData).find(
+  const root = normalizeRawData(rawData)
+  if (isRecord(root)) {
+    const rateLimit = root.rate_limit
+    if (isRecord(rateLimit) && isRecord(rateLimit.primary_window)) {
+      const primary = windowFromRecord(
+        ["rate_limit", "primary_window"],
+        rateLimit.primary_window
+      )
+      if (typeof primary?.usedPercent === "number") {
+        return primary.usedPercent
+      }
+    }
+  }
+
+  return parseQuotaWindows(root).find(
     (window) => typeof window.usedPercent === "number"
   )?.usedPercent
 }

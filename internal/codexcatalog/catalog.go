@@ -18,14 +18,30 @@ import (
 var embeddedCatalog []byte
 
 var (
-	catalogMu  sync.RWMutex
-	rawCatalog = append([]byte(nil), embeddedCatalog...)
-	response   map[string]any
-	loadErr    error
-	revision   uint64
+	catalogMu   sync.RWMutex
+	rawCatalog  = append([]byte(nil), embeddedCatalog...)
+	response    map[string]any
+	loadErr     error
+	revision    uint64
+	modelCount  int
+	updatedAt   time.Time
+	source      string
+	lastChecked time.Time
+	lastError   error
 )
 
 const refreshInterval = 3 * time.Hour
+
+// Status 描述当前模型目录缓存状态。
+type Status struct {
+	Revision           uint64    `json:"revision"`
+	ModelCount         int       `json:"model_count"`
+	UpdatedAt          time.Time `json:"updated_at,omitempty"`
+	Source             string    `json:"source,omitempty"`
+	RefreshIntervalSec int       `json:"refresh_interval_sec"`
+	LastCheckedAt      time.Time `json:"last_checked_at,omitempty"`
+	LastError          string    `json:"last_error,omitempty"`
+}
 
 var remoteCatalogURLs = []string{
 	"https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/codex_client_models.json",
@@ -33,7 +49,7 @@ var remoteCatalogURLs = []string{
 }
 
 func init() {
-	if err := loadFromBytes(embeddedCatalog); err != nil {
+	if err := loadFromBytes(embeddedCatalog, "embedded"); err != nil {
 		loadErr = err
 	}
 }
@@ -63,6 +79,21 @@ func Revision() uint64 {
 	catalogMu.RLock()
 	defer catalogMu.RUnlock()
 	return revision
+}
+
+// CurrentStatus 返回当前模型目录缓存状态的快照。
+func CurrentStatus() Status {
+	catalogMu.RLock()
+	defer catalogMu.RUnlock()
+	return Status{
+		Revision:           revision,
+		ModelCount:         modelCount,
+		UpdatedAt:          updatedAt,
+		Source:             source,
+		RefreshIntervalSec: int(refreshInterval / time.Second),
+		LastCheckedAt:      lastChecked,
+		LastError:          errorString(lastError),
+	}
 }
 
 func StartAutoRefresh(ctx context.Context) {
@@ -98,7 +129,7 @@ func RefreshOnce(ctx context.Context, client *http.Client) error {
 			lastErr = err
 			continue
 		}
-		if err = loadFromBytes(data); err != nil {
+		if err = loadFromBytes(data, endpoint); err != nil {
 			lastErr = err
 			continue
 		}
@@ -106,8 +137,16 @@ func RefreshOnce(ctx context.Context, client *http.Client) error {
 	}
 
 	if lastErr != nil {
+		catalogMu.Lock()
+		lastChecked = time.Now().UTC()
+		lastError = lastErr
+		catalogMu.Unlock()
 		return lastErr
 	}
+	catalogMu.Lock()
+	lastChecked = time.Now().UTC()
+	lastError = fmt.Errorf("codex catalog refresh failed")
+	catalogMu.Unlock()
 	return fmt.Errorf("codex catalog refresh failed")
 }
 
@@ -133,21 +172,41 @@ func fetchCatalog(ctx context.Context, client *http.Client, endpoint string) ([]
 	return data, nil
 }
 
-func loadFromBytes(data []byte) error {
+func loadFromBytes(data []byte, sourceName string) error {
 	var decoded map[string]any
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
+	}
+	count := 0
+	if models, ok := decoded["models"].([]any); ok {
+		count = len(models)
 	}
 
 	catalogMu.Lock()
 	defer catalogMu.Unlock()
 	if bytes.Equal(rawCatalog, data) && response != nil {
 		loadErr = nil
+		lastError = nil
+		updatedAt = time.Now().UTC()
+		lastChecked = updatedAt
+		source = sourceName
 		return nil
 	}
 	rawCatalog = append([]byte(nil), data...)
 	response = decoded
 	loadErr = nil
+	lastError = nil
 	revision++
+	modelCount = count
+	updatedAt = time.Now().UTC()
+	lastChecked = updatedAt
+	source = sourceName
 	return nil
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

@@ -816,10 +816,14 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 			if hasOutput && resStr != "" {
 				usage := gjson.GetBytes(completedEvent, "response.usage")
 				if usage.Exists() {
-					account.RecordUsage(
+					account.RecordUsageDetailed(
+						baseModel,
 						usage.Get("input_tokens").Int(),
 						usage.Get("output_tokens").Int(),
 						usage.Get("total_tokens").Int(),
+						usage.Get("input_tokens_details.cached_tokens").Int(),
+						usageCacheWriteTokens(usage),
+						usage.Get("output_tokens_details.reasoning_tokens").Int(),
 					)
 				}
 				result = []byte(resStr)
@@ -926,10 +930,14 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 		if resp, ok := extractCompletedResponseObject(data); ok {
 			usage := gjson.GetBytes(resp, "usage")
 			if usage.Exists() {
-				account.RecordUsage(
+				account.RecordUsageDetailed(
+					baseModel,
 					usage.Get("input_tokens").Int(),
 					usage.Get("output_tokens").Int(),
 					usage.Get("total_tokens").Int(),
+					usage.Get("input_tokens_details.cached_tokens").Int(),
+					usageCacheWriteTokens(usage),
+					usage.Get("output_tokens_details.reasoning_tokens").Int(),
 				)
 			}
 			account.RecordSuccess()
@@ -957,6 +965,20 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 		return nil, fmt.Errorf("未收到 response.completed 事件")
 	}
 	return nil, fmt.Errorf("读取响应失败")
+}
+
+func usageCacheWriteTokens(usage gjson.Result) int64 {
+	for _, path := range []string{
+		"input_tokens_details.cache_write_tokens",
+		"cache_write_tokens",
+		"cache_creation_input_tokens",
+	} {
+		value := usage.Get(path).Int()
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func extractCompletedResponseEvent(body []byte) ([]byte, bool) {
@@ -1114,6 +1136,7 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 		return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(err))
 	}
 
+	recordCompactUsage(account, baseModel, data)
 	account.RecordSuccess()
 	log.Infof("req summary responses-compact-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return data, nil
@@ -1139,6 +1162,32 @@ func (e *Executor) OpenCodexCompactStream(ctx context.Context, rc RetryConfig, r
 		ConvertDur: convertDur,
 		SendDur:    time.Since(sendStart),
 	}, nil
+}
+
+/**
+ * recordCompactUsage records token usage from a Compact response.
+ * Compact non-stream responses use top-level usage; wrapped responses are also supported.
+ */
+func recordCompactUsage(account *auth.Account, model string, body []byte) {
+	if account == nil {
+		return
+	}
+	usage := gjson.GetBytes(body, "usage")
+	if !usage.Exists() {
+		usage = gjson.GetBytes(body, "response.usage")
+	}
+	if !usage.Exists() || !usage.IsObject() {
+		return
+	}
+	account.RecordUsageDetailed(
+		model,
+		usage.Get("input_tokens").Int(),
+		usage.Get("output_tokens").Int(),
+		usage.Get("total_tokens").Int(),
+		usage.Get("input_tokens_details.cached_tokens").Int(),
+		usageCacheWriteTokens(usage),
+		usage.Get("output_tokens_details.reasoning_tokens").Int(),
+	)
 }
 
 /**

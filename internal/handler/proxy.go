@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"codex-proxy/internal/auth"
+	codexmeta "codex-proxy/internal/auth/codex"
 	"codex-proxy/internal/codexcatalog"
 	"codex-proxy/internal/executor"
 	"codex-proxy/internal/thinking"
@@ -171,6 +172,7 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 		apiResponses = h.authMiddleware(h.handleResponses)
 	}
 	r.POST("/v1/responses", apiResponses)
+	r.GET("/v1/responses", apiResponses)
 
 	apiResponsesCompact := h.handleResponsesCompact
 	if len(h.apiKeys) > 0 {
@@ -184,6 +186,12 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 	}
 	r.POST("/v1/messages", apiMessages)
 
+	apiMessageCountTokens := h.handleMessageCountTokens
+	if len(h.apiKeys) > 0 {
+		apiMessageCountTokens = h.authMiddleware(h.handleMessageCountTokens)
+	}
+	r.POST("/v1/messages/count_tokens", apiMessageCountTokens)
+
 	apiModels := h.handleModels
 	if len(h.apiKeys) > 0 {
 		apiModels = h.authMiddleware(h.handleModels)
@@ -195,16 +203,19 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 	refreshHandler := h.handleRefresh
 	checkQuotaHandler := h.handleCheckQuota
 	recoverAuthHandler := h.handleRecoverAuth
+	catalogRefreshHandler := h.handleCatalogRefresh
 	if len(h.apiKeys) > 0 {
 		statsHandler = h.authMiddleware(h.handleStats)
 		refreshHandler = h.authMiddleware(h.handleRefresh)
 		checkQuotaHandler = h.authMiddleware(h.handleCheckQuota)
 		recoverAuthHandler = h.authMiddleware(h.handleRecoverAuth)
+		catalogRefreshHandler = h.authMiddleware(h.handleCatalogRefresh)
 	}
 	r.GET("/stats", statsHandler)
 	r.POST("/refresh", refreshHandler)
 	r.POST("/check-quota", checkQuotaHandler)
 	r.POST("/recover-auth", recoverAuthHandler)
+	r.POST("/admin/catalog/refresh", catalogRefreshHandler)
 
 	accountsIngestHandler := h.handleAccountsIngest
 	accountsCreateHandler := h.handleAdminAccountsCreate
@@ -297,45 +308,66 @@ func (h *ProxyHandler) handleHealth(ctx *fasthttp.RequestCtx) {
 }
 
 type modelListEntry struct {
-	base     string
-	suffixes []string
+	base       string
+	suffixes   []string
+	allowFast  bool
+	allow1M    bool
+	allowImage bool
+	baseOnly   bool
+}
+
+func newModelListEntry(base string, suffixes []string) modelListEntry {
+	return modelListEntry{
+		base:       base,
+		suffixes:   suffixes,
+		allowFast:  true,
+		allow1M:    true,
+		allowImage: true,
+	}
 }
 
 var modelList = []modelListEntry{
-	{base: "gpt-5", suffixes: []string{"low", "medium", "high", "auto"}},
-	{base: "gpt-5-codex", suffixes: []string{"low", "medium", "high", "auto"}},
-	{base: "gpt-5-codex-mini", suffixes: []string{"low", "medium", "high", "auto"}},
-	{base: "gpt-5.1", suffixes: []string{"low", "medium", "high", "none", "auto"}},
-	{base: "gpt-5.1-codex", suffixes: []string{"low", "medium", "high", "max", "auto"}},
-	{base: "gpt-5.1-codex-mini", suffixes: []string{"low", "medium", "high", "auto"}},
-	{base: "gpt-5.1-codex-max", suffixes: []string{"low", "medium", "high", "xhigh", "auto"}},
-	{base: "gpt-5.2", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
-	{base: "gpt-5.2-codex", suffixes: []string{"low", "medium", "high", "xhigh", "auto"}},
-	{base: "gpt-5.3-codex", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
-	{base: "gpt-5.4", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
-	{base: "gpt-5.4-mini", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
-	{base: "gpt-5.5", suffixes: []string{"none", "minimal", "low", "medium", "high", "xhigh"}},
-	{base: "gpt-5.6-sol", suffixes: []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}},
-	{base: "gpt-5.6-terra", suffixes: []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}},
-	{base: "gpt-5.6-luna", suffixes: []string{"low", "medium", "high", "xhigh", "max", "auto"}},
+	newModelListEntry("gpt-5", []string{"low", "medium", "high", "auto"}),
+	newModelListEntry("gpt-5-codex", []string{"low", "medium", "high", "auto"}),
+	newModelListEntry("gpt-5-codex-mini", []string{"low", "medium", "high", "auto"}),
+	newModelListEntry("gpt-5.1", []string{"low", "medium", "high", "none", "auto"}),
+	newModelListEntry("gpt-5.1-codex", []string{"low", "medium", "high", "max", "auto"}),
+	newModelListEntry("gpt-5.1-codex-mini", []string{"low", "medium", "high", "auto"}),
+	newModelListEntry("gpt-5.1-codex-max", []string{"low", "medium", "high", "xhigh", "auto"}),
+	newModelListEntry("gpt-5.2", []string{"low", "medium", "high", "xhigh", "none", "auto"}),
+	newModelListEntry("gpt-5.2-codex", []string{"low", "medium", "high", "xhigh", "auto"}),
+	newModelListEntry("gpt-5.3-codex", []string{"low", "medium", "high", "xhigh", "none", "auto"}),
+	newModelListEntry("gpt-5.3-codex-spark", []string{"low", "medium", "high", "xhigh"}),
+	newModelListEntry("gpt-5.4", []string{"low", "medium", "high", "xhigh", "none", "auto"}),
+	newModelListEntry("gpt-5.4-mini", []string{"low", "medium", "high", "xhigh", "none", "auto"}),
+	newModelListEntry("gpt-5.5", []string{"none", "minimal", "low", "medium", "high", "xhigh"}),
+	newModelListEntry("gpt-5.6-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
+	{
+		base:     "gpt-5.6-sol-openai-compact",
+		baseOnly: true,
+	},
+	newModelListEntry("gpt-5.6-terra", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
+	newModelListEntry("gpt-5.6-luna", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
+	{
+		base:     "codex-auto-review",
+		baseOnly: true,
+	},
 }
 
-func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool, enableImage bool) []string {
+func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool, enableImage bool, allowFast bool, allow1M bool, allowImage bool) []string {
 	out := []string{id}
-	if enable1M {
+	if enable1M && allow1M {
 		out = append(out, id+"-1m")
 	}
-	if enableFast {
+	if enableFast && allowFast {
 		out = append(out, id+"-fast")
 	}
-	if enableFast && enable1M {
+	if enableFast && enable1M && allowFast && allow1M {
 		out = append(out, id+"-1m-fast", id+"-fast-1m")
 	}
-	if enableImage {
+	if enableImage && allowImage {
+		/* -image 是独立模式，不与 -fast、-1m 或思考后缀组合。 */
 		out = append(out, id+"-image")
-		if enableFast {
-			out = append(out, id+"-fast-image")
-		}
 	}
 	return out
 }
@@ -356,7 +388,8 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
 			ids = append(ids, e.base+"-"+s)
 		}
 		for _, id := range ids {
-			for _, mid := range expandModelSubvariantIDs(id, h.enableModelFast, h.enableModel1M, h.enableModelImage) {
+			allowImage := e.allowImage && id == e.base
+			for _, mid := range expandModelSubvariantIDs(id, h.enableModelFast, h.enableModel1M, h.enableModelImage, e.allowFast, e.allow1M, allowImage) {
 				models = append(models, map[string]interface{}{"id": mid, "object": "model", "owned_by": "openai"})
 			}
 		}
@@ -368,18 +401,137 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
 	})
 }
 
-func (h *ProxyHandler) validateModelSuffixOptions(model string) error {
-	parsed := thinking.ParseModelSuffix(model)
-	if parsed.IsFast && !h.enableModelFast {
+type modelRequestOptions struct {
+	entry         *modelListEntry
+	isFast        bool
+	is1M          bool
+	isImage       bool
+	hasThinking   bool
+	unknownSuffix bool
+}
+
+func parseModelRequestOptions(model string) modelRequestOptions {
+	trimmed := strings.TrimSpace(model)
+	lower := strings.ToLower(trimmed)
+	result := modelRequestOptions{}
+	var best *modelListEntry
+	bestLen := -1
+	for i := range modelList {
+		baseLower := strings.ToLower(modelList[i].base)
+		if (lower == baseLower || strings.HasPrefix(lower, baseLower+"-")) && len(baseLower) > bestLen {
+			best = &modelList[i]
+			bestLen = len(baseLower)
+		}
+	}
+	if best == nil {
+		parsed := thinking.ParseModelSuffix(trimmed)
+		result.isFast = parsed.IsFast
+		result.is1M = parsed.Is1M
+		result.isImage = parsed.IsImage || strings.Contains(lower, "-image-") || strings.HasSuffix(lower, "-image")
+		result.hasThinking = parsed.HasSuffix
+		if result.isImage {
+			for _, suffix := range strings.Split(lower, "-") {
+				switch suffix {
+				case "fast":
+					result.isFast = true
+				case "1m":
+					result.is1M = true
+				case "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "none", "auto":
+					result.hasThinking = true
+				default:
+					if value, err := strconv.Atoi(suffix); err == nil && value > 100 {
+						result.hasThinking = true
+					}
+				}
+			}
+		}
+		return result
+	}
+
+	result.entry = best
+	remainder := strings.TrimPrefix(lower, strings.ToLower(best.base))
+	if remainder == "" {
+		return result
+	}
+	for _, suffix := range strings.Split(strings.TrimPrefix(remainder, "-"), "-") {
+		switch suffix {
+		case "fast":
+			result.isFast = true
+		case "1m":
+			result.is1M = true
+		case "image":
+			result.isImage = true
+		case "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "none", "auto":
+			result.hasThinking = true
+		default:
+			if value, err := strconv.Atoi(suffix); err == nil && value > 100 {
+				result.hasThinking = true
+			} else {
+				result.unknownSuffix = true
+			}
+		}
+	}
+	return result
+}
+
+func hasRequestField(body []byte, path string) bool {
+	return len(body) > 0 && gjson.ValidBytes(body) && gjson.GetBytes(body, path).Exists()
+}
+
+func (h *ProxyHandler) validateModelRequestOptions(model string, body []byte) error {
+	options := parseModelRequestOptions(model)
+	if options.isFast && !h.enableModelFast {
 		return fmt.Errorf("模型后缀 -fast 已禁用")
 	}
-	if parsed.Is1M && !h.enableModel1M {
+	if options.is1M && !h.enableModel1M {
 		return fmt.Errorf("模型后缀 -1m 已禁用")
 	}
-	if parsed.IsImage && !h.enableModelImage {
+	if options.isImage && !h.enableModelImage {
 		return fmt.Errorf("模型后缀 -image 已禁用")
 	}
+	if options.isImage && (options.isFast || options.is1M || options.hasThinking) {
+		return fmt.Errorf("模型后缀 -image 不能与 -fast、-1m 或思考等级组合")
+	}
+	if options.entry != nil {
+		if options.entry.baseOnly && (options.unknownSuffix || options.isFast || options.is1M || options.isImage || options.hasThinking) {
+			return fmt.Errorf("模型 %s 不支持 -fast、-1m、-image 或思考等级参数", options.entry.base)
+		}
+		if options.isFast && !options.entry.allowFast {
+			return fmt.Errorf("模型 %s 不支持 -fast", options.entry.base)
+		}
+		if options.is1M && !options.entry.allow1M {
+			return fmt.Errorf("模型 %s 不支持 -1m", options.entry.base)
+		}
+		if options.isImage && !options.entry.allowImage {
+			return fmt.Errorf("模型 %s 不支持 -image", options.entry.base)
+		}
+	}
+
+	if options.isImage {
+		for _, path := range []string{"reasoning", "reasoning.effort", "reasoning_effort", "variant", "service_tier", "speed", "thinking", "output_config.effort"} {
+			if hasRequestField(body, path) {
+				return fmt.Errorf("-image 模式不能传递 %s 参数", path)
+			}
+		}
+	}
+	if options.entry != nil && options.entry.baseOnly {
+		for _, path := range []string{"reasoning", "reasoning.effort", "reasoning_effort", "variant", "thinking", "output_config.effort"} {
+			if hasRequestField(body, path) {
+				return fmt.Errorf("模型 %s 不支持 %s 参数", options.entry.base, path)
+			}
+		}
+		if serviceTier := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "service_tier").String())); serviceTier == "fast" || serviceTier == "priority" {
+			return fmt.Errorf("模型 %s 不支持 fast 参数", options.entry.base)
+		}
+		if speed := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "speed").String())); speed == "fast" {
+			return fmt.Errorf("模型 %s 不支持 fast 参数", options.entry.base)
+		}
+	}
 	return nil
+}
+
+func (h *ProxyHandler) validateModelSuffixOptions(model string) error {
+	return h.validateModelRequestOptions(model, nil)
 }
 
 /**
@@ -643,7 +795,7 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 		writeJSON(ctx, fasthttp.StatusBadRequest, map[string]any{"error": map[string]any{"message": "缺少 model 字段", "type": "invalid_request_error"}})
 		return
 	}
-	if err := h.validateModelSuffixOptions(model); err != nil {
+	if err := h.validateModelRequestOptions(model, body); err != nil {
 		writeJSON(ctx, fasthttp.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}})
 		return
 	}
@@ -691,6 +843,41 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 	ctx.SetBody(result)
 }
 
+func catalogStatusPayload() map[string]any {
+	status := codexcatalog.CurrentStatus()
+	return map[string]any{
+		"revision":             status.Revision,
+		"model_count":          status.ModelCount,
+		"updated_at":           status.UpdatedAt,
+		"source":               status.Source,
+		"refresh_interval_sec": status.RefreshIntervalSec,
+		"last_checked_at":      status.LastCheckedAt,
+		"last_error":           status.LastError,
+		"client_version":       codexmeta.ClientVersion,
+	}
+}
+
+/**
+ * handleCatalogRefresh 手动刷新 Codex 客户端模型目录
+ */
+func (h *ProxyHandler) handleCatalogRefresh(ctx *fasthttp.RequestCtx) {
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	if err := codexcatalog.RefreshOnce(refreshCtx, nil); err != nil {
+		writeJSON(ctx, fasthttp.StatusBadGateway, map[string]any{
+			"error": map[string]any{
+				"message": err.Error(),
+				"type":    "catalog_refresh_error",
+			},
+			"catalog": catalogStatusPayload(),
+		})
+		return
+	}
+	writeJSON(ctx, fasthttp.StatusOK, map[string]any{
+		"catalog": catalogStatusPayload(),
+	})
+}
+
 /**
  * handleStats 账号统计接口
  * 返回所有账号的状态、请求数、错误数等统计信息
@@ -702,7 +889,9 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 	includeQuota := queryBoolArg(args, "include_quota")
 	accounts := h.manager.GetAccounts()
 	active, cooldown, disabled := 0, 0, 0
-	var totalInputTokens, totalOutputTokens int64
+	var totalInputTokens, totalOutputTokens, totalCompletions int64
+	var totalTokens, totalCacheReadTokens, totalCacheWriteTokens, totalReasoningTokens int64
+	quotaChecked, quotaValid, quotaInvalid, quotaExhausted := 0, 0, 0, 0
 
 	if !pageMode {
 		stats := make([]auth.AccountStats, 0, len(accounts))
@@ -711,6 +900,22 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 			stats = append(stats, s)
 			totalInputTokens += s.Usage.InputTokens
 			totalOutputTokens += s.Usage.OutputTokens
+			totalTokens += s.Usage.TotalTokens
+			totalCacheReadTokens += s.Usage.CacheReadTokens
+			totalCacheWriteTokens += s.Usage.CacheWriteTokens
+			totalReasoningTokens += s.Usage.ReasoningTokens
+			totalCompletions += s.Usage.TotalCompletions
+			if s.Quota != nil {
+				quotaChecked++
+				if s.Quota.Valid {
+					quotaValid++
+				} else {
+					quotaInvalid++
+				}
+			}
+			if s.QuotaExhausted {
+				quotaExhausted++
+			}
 			switch s.Status {
 			case "active":
 				active++
@@ -723,14 +928,24 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 
 		writeJSON(ctx, fasthttp.StatusOK, map[string]any{
 			"summary": map[string]any{
-				"total":               len(accounts),
-				"active":              active,
-				"cooldown":            cooldown,
-				"disabled":            disabled,
-				"rpm":                 GetRPM(),
-				"total_input_tokens":  totalInputTokens,
-				"total_output_tokens": totalOutputTokens,
+				"total":                    len(accounts),
+				"active":                   active,
+				"cooldown":                 cooldown,
+				"disabled":                 disabled,
+				"rpm":                      GetRPM(),
+				"total_completions":        totalCompletions,
+				"total_input_tokens":       totalInputTokens,
+				"total_output_tokens":      totalOutputTokens,
+				"total_cache_read_tokens":  totalCacheReadTokens,
+				"total_cache_write_tokens": totalCacheWriteTokens,
+				"total_reasoning_tokens":   totalReasoningTokens,
+				"total_tokens":             totalTokens,
+				"quota_checked":            quotaChecked,
+				"quota_valid":              quotaValid,
+				"quota_invalid":            quotaInvalid,
+				"quota_exhausted":          quotaExhausted,
 			},
+			"catalog":  catalogStatusPayload(),
 			"accounts": stats,
 		})
 		return
@@ -747,6 +962,22 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 		s := acc.GetStats()
 		totalInputTokens += s.Usage.InputTokens
 		totalOutputTokens += s.Usage.OutputTokens
+		totalTokens += s.Usage.TotalTokens
+		totalCacheReadTokens += s.Usage.CacheReadTokens
+		totalCacheWriteTokens += s.Usage.CacheWriteTokens
+		totalReasoningTokens += s.Usage.ReasoningTokens
+		totalCompletions += s.Usage.TotalCompletions
+		if s.Quota != nil {
+			quotaChecked++
+			if s.Quota.Valid {
+				quotaValid++
+			} else {
+				quotaInvalid++
+			}
+		}
+		if s.QuotaExhausted {
+			quotaExhausted++
+		}
 		switch s.Status {
 		case "active":
 			active++
@@ -778,14 +1009,24 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 
 	writeJSON(ctx, fasthttp.StatusOK, map[string]any{
 		"summary": map[string]any{
-			"total":               len(accounts),
-			"active":              active,
-			"cooldown":            cooldown,
-			"disabled":            disabled,
-			"rpm":                 GetRPM(),
-			"total_input_tokens":  totalInputTokens,
-			"total_output_tokens": totalOutputTokens,
+			"total":                    len(accounts),
+			"active":                   active,
+			"cooldown":                 cooldown,
+			"disabled":                 disabled,
+			"rpm":                      GetRPM(),
+			"total_completions":        totalCompletions,
+			"total_input_tokens":       totalInputTokens,
+			"total_output_tokens":      totalOutputTokens,
+			"total_cache_read_tokens":  totalCacheReadTokens,
+			"total_cache_write_tokens": totalCacheWriteTokens,
+			"total_reasoning_tokens":   totalReasoningTokens,
+			"total_tokens":             totalTokens,
+			"quota_checked":            quotaChecked,
+			"quota_valid":              quotaValid,
+			"quota_invalid":            quotaInvalid,
+			"quota_exhausted":          quotaExhausted,
 		},
+		"catalog":  catalogStatusPayload(),
 		"accounts": stats,
 		"pagination": statsPagination{
 			Page:          page,
@@ -955,7 +1196,11 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 		sendError(ctx, fasthttp.StatusBadRequest, "缺少 model 字段", "invalid_request_error")
 		return
 	}
-	if err := h.validateModelSuffixOptions(model); err != nil {
+	if model == "gpt-5.6-sol-openai-compact" {
+		h.handleResponsesCompact(ctx)
+		return
+	}
+	if err := h.validateModelRequestOptions(model, body); err != nil {
 		sendError(ctx, fasthttp.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -1014,10 +1259,12 @@ const wsHeartbeatInterval = 30 * time.Second
 
 /* wsSession 管理单个 WebSocket 连接的读写、心跳 */
 type wsSession struct {
-	conn      *websocket.Conn
-	writeMu   sync.Mutex
-	closed    chan struct{}
-	closeOnce sync.Once
+	conn           *websocket.Conn
+	writeMu        sync.Mutex
+	closed         chan struct{}
+	closeOnce      sync.Once
+	lastModel      string
+	lastResponseID string
 }
 
 func newWSSession(conn *websocket.Conn) *wsSession {
@@ -1093,30 +1340,48 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 
 			eventType := gjson.GetBytes(message, "type").String()
 			switch eventType {
-			case "response.create":
-				respObj := gjson.GetBytes(message, "response")
-				if !respObj.Exists() {
-					h.writeWSErrorSession(sess, "invalid_request_error", "缺少 response 字段")
-					continue
+			case "response.create", "response.append":
+				var requestBody []byte
+				if eventType == "response.create" {
+					respObj := gjson.GetBytes(message, "response")
+					if respObj.Exists() {
+						requestBody = []byte(respObj.Raw)
+					} else {
+						requestBody = append([]byte(nil), message...)
+						requestBody, _ = sjson.DeleteBytes(requestBody, "type")
+					}
+				} else {
+					input := gjson.GetBytes(message, "input")
+					if !input.Exists() || !input.IsArray() {
+						h.writeWSErrorSession(sess, "invalid_request_error", "response.append 缺少 input 数组")
+						continue
+					}
+					requestBody = append([]byte(nil), message...)
+					requestBody, _ = sjson.DeleteBytes(requestBody, "type")
+					if gjson.GetBytes(requestBody, "model").String() == "" && sess.lastModel != "" {
+						requestBody, _ = sjson.SetBytes(requestBody, "model", sess.lastModel)
+					}
+					if gjson.GetBytes(requestBody, "previous_response_id").String() == "" && sess.lastResponseID != "" {
+						requestBody, _ = sjson.SetBytes(requestBody, "previous_response_id", sess.lastResponseID)
+					}
 				}
 
-				requestBody := []byte(respObj.Raw)
 				requestBody, _ = sjson.SetBytes(requestBody, "stream", true)
-
 				model := gjson.GetBytes(requestBody, "model").String()
 				if model == "" {
 					h.writeWSErrorSession(sess, "invalid_request_error", "缺少 model 字段")
 					continue
 				}
-				if err := h.validateModelSuffixOptions(model); err != nil {
+				if err := h.validateModelRequestOptions(model, requestBody); err != nil {
 					h.writeWSErrorSession(sess, "invalid_request_error", err.Error())
 					continue
 				}
 
-				log.Debugf("responses ws: model=%s", model)
+				log.Debugf("responses ws: event=%s model=%s", eventType, model)
 				rc := h.buildRetryConfig()
 				streamErr := h.forwardResponsesSSEAsWSSession(ctx, sess, rc, requestBody, model)
 				if streamErr == nil {
+					sess.lastModel = model
 					RecordRequest()
 				} else if errors.Is(streamErr, executor.ErrEmptyResponse) {
 					h.writeWSErrorSession(sess, "invalid_response", "empty response")
@@ -1179,8 +1444,17 @@ func (h *ProxyHandler) pumpSSEToWSSession(s *executor.CodexResponsesStream, sess
 			log.Debugf("ws-frame-out: %s", payload)
 		}
 
+		eventName := gjson.GetBytes(payload, "type").String()
+		responseID := gjson.GetBytes(payload, "response.id").String()
+		if responseID == "" && (eventName == "response.created" || eventName == "response.completed" || eventName == "response.done") {
+			responseID = gjson.GetBytes(payload, "id").String()
+		}
+		if responseID != "" {
+			sess.lastResponseID = responseID
+		}
+
 		if !hasContent {
-			typ := gjson.GetBytes(payload, "type").String()
+			typ := eventName
 			switch typ {
 			case "response.output_text.delta":
 				if gjson.GetBytes(payload, "delta").String() != "" {
@@ -1266,7 +1540,7 @@ func (h *ProxyHandler) handleResponsesCompact(ctx *fasthttp.RequestCtx) {
 		sendError(ctx, fasthttp.StatusBadRequest, "缺少 model 字段", "invalid_request_error")
 		return
 	}
-	if err := h.validateModelSuffixOptions(model); err != nil {
+	if err := h.validateModelRequestOptions(model, body); err != nil {
 		sendError(ctx, fasthttp.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}

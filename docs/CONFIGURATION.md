@@ -37,10 +37,19 @@
 ## 代理与日志
 
 
-| 配置项         | 默认值    | 说明                                              |
-| ----------- | ------ | ----------------------------------------------- |
-| `proxy-url` | 空      | 出站 HTTP(S)/SOCKS5 代理，格式见 `config.example.yaml`。 |
-| `log-level` | `info` | `debug` / `info` / `warn` / `error`。            |
+| 配置项                   | 默认值    | 说明                                                                                 |
+| --------------------- | ------ | ---------------------------------------------------------------------------------- |
+| `proxy-url`           | 空      | 出站 HTTP(S)/SOCKS5 代理，格式见 `config.example.yaml`。                                  |
+| `log-level`           | `info` | `debug` / `info` / `warn` / `error`。                                               |
+| `log-format`          | `text` | `text` 或 `json`；JSON 为单行结构化日志且不含 ANSI 颜色。                                      |
+| `log-color`           | `auto` | 文本日志颜色：`auto` / `always` / `never`；非 TTY 的 `auto` 自动关闭。                         |
+| `log-report-caller`   | `false` | 是否输出调用文件和行号。                                                               |
+| `log-dir`             | `logs` | 日志目录；默认生成 `app.log` 与独立的 `error.log`。                                      |
+| `log-max-size-mb`     | `100`  | 单个日志文件达到该大小后自动轮换，单位 MB。                                               |
+| `log-max-backups`     | `7`    | 轮换文件最大备份数，`0` 表示不按数量删除。                                                |
+| `log-max-age-days`    | `30`   | 轮换文件最大保留天数，`0` 表示不按时间删除。                                               |
+| `log-compress`        | `true` | 是否压缩轮换后的日志文件。                                                               |
+| `log-separate-error-file` | `true` | 是否将 `error`、`fatal`、`panic` 独立写入 `error.log`；普通文件保留 `debug`、`info`、`warn`。 |
 
 
 ## Token 刷新与限流策略

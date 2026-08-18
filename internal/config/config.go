@@ -13,7 +13,6 @@ import (
 
 	"codex-proxy/internal/netutil"
 
-	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
@@ -52,6 +51,24 @@ type Config struct {
 	BackendResolveAddress string `yaml:"backend-resolve-address"`
 	BaseURL               string `yaml:"base-url"`
 	LogLevel              string `yaml:"log-level"`
+	/* LogFormat 控制日志输出格式：text 或 json */
+	LogFormat string `yaml:"log-format"`
+	/* LogColor 控制文本日志颜色：auto、always 或 never；JSON 日志始终不使用颜色 */
+	LogColor string `yaml:"log-color"`
+	/* LogReportCaller 为 true 时附加调用文件和行号 */
+	LogReportCaller bool `yaml:"log-report-caller"`
+	/* LogDir 日志文件目录，默认为 logs */
+	LogDir string `yaml:"log-dir"`
+	/* LogMaxSizeMB 单个日志文件达到该大小后轮换 */
+	LogMaxSizeMB int `yaml:"log-max-size-mb"`
+	/* LogMaxBackups 保留的轮换文件数量，0 表示不按数量删除 */
+	LogMaxBackups int `yaml:"log-max-backups"`
+	/* LogMaxAgeDays 保留轮换文件的天数，0 表示不按时间删除 */
+	LogMaxAgeDays int `yaml:"log-max-age-days"`
+	/* LogCompress 是否压缩轮换后的日志文件 */
+	LogCompress bool `yaml:"log-compress"`
+	/* LogSeparateErrorFile 是否将 error/fatal 单独写入 error.log */
+	LogSeparateErrorFile bool `yaml:"log-separate-error-file"`
 	/* DebugUpstreamStream 为 true 时按行/块 Info 打印上游 SSE 原始内容，日志量大且可能含隐私，仅排障时短期开启 */
 	DebugUpstreamStream    bool `yaml:"debug-upstream-stream"`
 	RefreshInterval        int  `yaml:"refresh-interval"`
@@ -179,6 +196,15 @@ func LoadConfig(path string) (*Config, error) {
 		BackendDomain:                    "",
 		BaseURL:                          "",
 		LogLevel:                         "info",
+		LogFormat:                        "text",
+		LogColor:                         "auto",
+		LogReportCaller:                  false,
+		LogDir:                           "logs",
+		LogMaxSizeMB:                     100,
+		LogMaxBackups:                    7,
+		LogMaxAgeDays:                    30,
+		LogCompress:                      true,
+		LogSeparateErrorFile:             true,
 		RefreshInterval:                  3000,
 		MaxRetry:                         2,
 		EnableHealthyRetry:               true,
@@ -252,6 +278,30 @@ func (c *Config) Sanitize() {
 	c.BackendResolveAddress = strings.TrimSpace(c.BackendResolveAddress)
 	c.BaseURL = strings.TrimSpace(c.BaseURL)
 	c.LogLevel = strings.TrimSpace(strings.ToLower(c.LogLevel))
+	c.LogFormat = strings.TrimSpace(strings.ToLower(c.LogFormat))
+	if c.LogFormat != "text" && c.LogFormat != "json" {
+		c.LogFormat = "text"
+	}
+	c.LogColor = strings.TrimSpace(strings.ToLower(c.LogColor))
+	if c.LogColor != "auto" && c.LogColor != "always" && c.LogColor != "never" {
+		c.LogColor = "auto"
+	}
+	c.LogDir = strings.TrimSpace(c.LogDir)
+	if c.LogDir == "" {
+		c.LogDir = "logs"
+	}
+	if c.LogMaxSizeMB <= 0 {
+		c.LogMaxSizeMB = 100
+	}
+	if c.LogMaxSizeMB > 4096 {
+		c.LogMaxSizeMB = 4096
+	}
+	if c.LogMaxBackups < 0 {
+		c.LogMaxBackups = 0
+	}
+	if c.LogMaxAgeDays < 0 {
+		c.LogMaxAgeDays = 0
+	}
 
 	if c.Listen == "" {
 		c.Listen = ":8080"
@@ -511,11 +561,6 @@ func (c *Config) Sanitize() {
 	case "debug", "info", "warn", "error":
 	default:
 		c.LogLevel = "info"
-	}
-
-	level, err := log.ParseLevel(c.LogLevel)
-	if err == nil {
-		log.SetLevel(level)
 	}
 }
 

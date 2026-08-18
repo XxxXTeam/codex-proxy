@@ -377,7 +377,7 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 			continue
 		}
 		// 扫描正常结束：无正文/工具/思维（含仅有元数据/ error.failed / 空 response.completed），且未向客户端写 chunk → 换号再拉流
-		contentEmpty := !state.HasText && !state.HasToolCall && !state.HasReasoning
+		contentEmpty := !state.HasText && !state.HasToolCall && !state.HasReasoning && !state.HasImage
 		if contentEmpty && chunkCount == 0 && s.reopenFn != nil && round < s.pumpRounds-1 {
 			if fp := s.account.FilePath; fp != "" {
 				s.reopenExcluded[fp] = true
@@ -423,7 +423,7 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 	}
 
 	/* 无正文/工具/思维且未向客户端写任何 chunk：含「上游有 SSE 但空 completed」或仅元数据/失败事件 */
-	if !state.HasText && !state.HasToolCall && !state.HasReasoning && chunkCount == 0 {
+	if !state.HasText && !state.HasToolCall && !state.HasReasoning && !state.HasImage && chunkCount == 0 {
 		firstChunkDur := time.Duration(0)
 		completedDur := time.Duration(0)
 		tailAfterCompleted := time.Duration(0)
@@ -479,7 +479,15 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 	doneWriteDur := time.Since(doneWriteStart)
 
 	if state.UsageInput > 0 || state.UsageOutput > 0 {
-		s.account.RecordUsage(state.UsageInput, state.UsageOutput, state.UsageTotal)
+		s.account.RecordUsageDetailed(
+			s.BaseModel,
+			state.UsageInput,
+			state.UsageOutput,
+			state.UsageTotal,
+			state.UsageCacheRead,
+			state.UsageCacheWrite,
+			state.UsageReasoning,
+		)
 	}
 	s.account.RecordSuccess()
 	firstChunkDur := time.Duration(0)

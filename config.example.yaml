@@ -55,6 +55,24 @@ backend-domain: "chatgpt.com"
 
 # 日志级别: debug, info, warn, error
 log-level: "info"
+# 日志格式: text 或 json；json 始终不输出 ANSI 颜色
+# log-format: "text"
+# 文本日志颜色: auto、always 或 never；非 TTY 的 auto 默认关闭颜色
+# log-color: "auto"
+# 是否记录调用文件和行号
+# log-report-caller: false
+# 日志目录，默认 logs
+# log-dir: "logs"
+# 单个日志文件轮换大小（MB）
+# log-max-size-mb: 100
+# 轮换日志最大备份数，0 表示不按数量删除
+# log-max-backups: 7
+# 轮换日志最大保留天数，0 表示不按时间删除
+# log-max-age-days: 30
+# 是否压缩轮换后的日志文件
+# log-compress: true
+# 是否将 error/fatal/panic 独立写入 logs/error.log
+# log-separate-error-file: true
 
 # 排障：按行/块 Info 打印上游 Codex SSE 原始内容（Chat 与 Responses 流式）；日志量极大且可能含用户数据，用完请关闭
 # debug-upstream-stream: true

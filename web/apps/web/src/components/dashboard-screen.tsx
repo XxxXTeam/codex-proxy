@@ -1,6 +1,7 @@
-import { Activity, Clock, Database, ShieldCheck } from "lucide-react"
+import { Activity, Boxes, Clock, Database, RefreshCw, ShieldCheck } from "lucide-react"
 
 import { Badge } from "@workspace/ui/components/badge"
+import { Button } from "@workspace/ui/components/button"
 import {
   Card,
   CardAction,
@@ -12,7 +13,7 @@ import {
 
 import type { StatsResponse } from "@/lib/api"
 import { buildDashboard } from "@/lib/dashboard"
-import { formatNumber, formatPercent } from "@/lib/format"
+import { formatDateTime, formatNumber, formatPercent } from "@/lib/format"
 import { DonutChart, HorizontalBars, MetricBars } from "@/components/simple-charts"
 
 function SummaryCard({
@@ -46,13 +47,22 @@ function SummaryCard({
   )
 }
 
-export function DashboardScreen({ stats }: { stats: StatsResponse | null }) {
+export function DashboardScreen({
+  stats,
+  onRefreshCatalog,
+  catalogRefreshing = false,
+}: {
+  stats: StatsResponse | null
+  onRefreshCatalog?: () => void
+  catalogRefreshing?: boolean
+}) {
   const dashboard = buildDashboard(stats)
   const totalAccounts = stats?.summary.total ?? 0
+  const catalog = stats?.catalog
 
   return (
     <section className="flex flex-col gap-3">
-      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 xl:grid-cols-6">
         <SummaryCard
           title="账号总数"
           value={formatNumber(totalAccounts)}
@@ -80,10 +90,88 @@ export function DashboardScreen({ stats }: { stats: StatsResponse | null }) {
               ? "未知"
               : formatPercent(dashboard.averageQuota)
           }
-          detail={`${formatNumber(dashboard.checkedCount)} 个账号已有额度快照`}
+          detail={`${formatNumber(stats?.summary.quota_checked ?? dashboard.checkedCount)} 已检查 / ${formatNumber(stats?.summary.quota_exhausted)} 用尽`}
+          icon={ShieldCheck}
+        />
+        <SummaryCard
+          title="Token 总量"
+          value={formatNumber(stats?.summary.total_tokens)}
+          detail={`输入 ${formatNumber(stats?.summary.total_input_tokens)} / 输出 ${formatNumber(stats?.summary.total_output_tokens)} · 缓存读 ${formatNumber(stats?.summary.total_cache_read_tokens)} · 推理 ${formatNumber(stats?.summary.total_reasoning_tokens)}`}
+          icon={Activity}
+        />
+        <SummaryCard
+          title="额度健康"
+          value={formatNumber(stats?.summary.quota_valid)}
+          detail={`${formatNumber(stats?.summary.quota_invalid)} 个快照无效`}
           icon={ShieldCheck}
         />
       </div>
+
+      <Card>
+        <CardHeader className="gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <CardTitle>模型目录与客户端</CardTitle>
+            <CardDescription>
+              服务端缓存远端 Codex 客户端模型目录，后台按固定周期刷新。
+            </CardDescription>
+          </div>
+          <CardAction>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onRefreshCatalog}
+              disabled={!onRefreshCatalog || catalogRefreshing}
+            >
+              <RefreshCw data-icon="inline-start" />
+              {catalogRefreshing ? "更新中" : "立即更新"}
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+          <div>
+            <div className="text-xs text-muted-foreground">客户端版本</div>
+            <div className="mt-1 font-mono text-sm font-semibold">
+              {catalog?.client_version || "未知"}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground">模型数量</div>
+            <div className="mt-1 flex items-center gap-2 font-mono text-sm font-semibold">
+              <Boxes className="size-4 text-muted-foreground" />
+              {formatNumber(catalog?.model_count)}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground">目录 revision</div>
+            <div className="mt-1 font-mono text-sm font-semibold">
+              {formatNumber(catalog?.revision)}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground">最近成功更新</div>
+            <div className="mt-1 text-sm font-semibold">
+              {catalog?.updated_at ? formatDateTime(catalog.updated_at) : "未记录"}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground">刷新策略</div>
+            <div className="mt-1 text-sm font-semibold">
+              {catalog?.refresh_interval_sec
+                ? `${Math.round(catalog.refresh_interval_sec / 3600)} 小时`
+                : "未知"}
+            </div>
+            {catalog?.last_error ? (
+              <Badge variant="destructive" className="mt-1 max-w-full truncate">
+                刷新失败
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className="mt-1">
+                {catalog?.source || "本地缓存"}
+              </Badge>
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
       <div className="grid gap-3 xl:grid-cols-[1.05fr_0.95fr]">
         <Card>

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	codexdb "codex-proxy/internal/db"
 	"codex-proxy/internal/executor"
 	"codex-proxy/internal/handler"
+	"codex-proxy/internal/logutil"
 	"codex-proxy/internal/static"
 
 	"github.com/fasthttp/router"
@@ -31,25 +33,9 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-/* ANSI 颜色代码 */
-const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorCyan   = "\033[36m"
-	colorGray   = "\033[90m"
-	colorWhite  = "\033[97m"
-)
+var requestSeq uint64
 
 func main() {
-	/* 配置 logrus 彩色日志格式 */
-	log.SetFormatter(&log.TextFormatter{
-		ForceColors:     true,
-		FullTimestamp:   true,
-		TimestampFormat: "15:04:05",
-	})
 
 	configPath := flag.String("config", "config.yaml", "配置文件路径")
 	toJSON := flag.Bool("tojson", false, "将数据库账号导出为 JSON 文件到 auth-dir 目录（需配置数据库连接）")
@@ -59,6 +45,9 @@ func main() {
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
+	}
+	if err := logutil.Setup(cfg); err != nil {
+		log.Fatalf("初始化日志失败: %v", err)
 	}
 
 	/* 处理子命令 */
@@ -100,13 +89,14 @@ func main() {
 		return
 	}
 
-	log.Infof("%s⚡ Codex Proxy 启动中...%s", colorCyan, colorReset)
-	log.Infof("监听地址: %s%s%s", colorGreen, cfg.Listen, colorReset)
+	log.Info("Codex Proxy 启动中")
+	log.Infof("监听地址: %s", cfg.Listen)
+	log.Infof("日志目录: %s", cfg.LogDir)
 	if cfg.DBEnabled {
 		switch cfg.DBDriver {
 		case "mysql":
-			log.Infof("%s持久化: MySQL（Token 直写数据库）%s — %s:%d/%s",
-				colorCyan, colorReset, cfg.DBHost, cfg.DBPort, strings.TrimSpace(cfg.DBName))
+			log.Infof("持久化: MySQL  - %s:%d/%s",
+				cfg.DBHost, cfg.DBPort, strings.TrimSpace(cfg.DBName))
 		case "sqlite":
 			dsn := strings.TrimSpace(cfg.DBDSN)
 			if dsn == "" {
@@ -115,34 +105,34 @@ func main() {
 					dsn = "codex_proxy.db"
 				}
 			}
-			log.Infof("%s持久化: SQLite（Token 直写数据库）%s — %s", colorCyan, colorReset, dsn)
+			log.Infof("持久化: SQLite - %s", dsn)
 		default:
-			log.Infof("%s持久化: PostgreSQL（Token 直写数据库）%s — %s:%d/%s sslmode=%s",
-				colorCyan, colorReset, cfg.DBHost, cfg.DBPort, strings.TrimSpace(cfg.DBName), cfg.DBSSLMode)
+			log.Infof("持久化: PostgreSQL- %s:%d/%s sslmode=%s",
+				cfg.DBHost, cfg.DBPort, strings.TrimSpace(cfg.DBName), cfg.DBSSLMode)
 		}
 		if strings.TrimSpace(cfg.AuthDir) != "" {
-			log.Infof("账号目录（JSON 可导入 DB）: %s", cfg.AuthDir)
+			log.Infof("账号目录: %s", cfg.AuthDir)
 		} else {
-			log.Infof("账号目录: （未配置，仅从数据库加载）")
+			log.Infof("从数据库加载）")
 		}
 	} else {
 		log.Infof("账号目录: %s", cfg.AuthDir)
 	}
 	log.Infof("API 基础 URL: %s", cfg.BaseURL)
 	if cfg.ProxyURL != "" {
-		log.Infof("代理地址: %s%s%s", colorGreen, cfg.ProxyURL, colorReset)
+		log.Infof("代理地址: %s", cfg.ProxyURL)
 	}
 	log.Infof("刷新间隔: %d 秒", cfg.RefreshInterval)
 	log.Infof("最大重试: %d 次", cfg.MaxRetry)
 	if cfg.UpstreamPoolAutoScale {
-		log.Infof("出站连接池(自适应): max-conns-per-host=%d max-idle-per-host=%d max-idle=%d tcp_nodelay=on",
+		log.Infof("出站连接池: max-conns-per-host=%d max-idle-per-host=%d max-idle=%d tcp_nodelay=on",
 			cfg.MaxConnsPerHost, cfg.MaxIdleConnsPerHost, cfg.MaxIdleConns)
 	} else {
-		log.Infof("出站连接池(手动): max-conns-per-host=%d max-idle-per-host=%d max-idle=%d tcp_nodelay=on",
+		log.Infof("出站连接池: max-conns-per-host=%d max-idle-per-host=%d max-idle=%d tcp_nodelay=on",
 			cfg.MaxConnsPerHost, cfg.MaxIdleConnsPerHost, cfg.MaxIdleConns)
 	}
 	if cfg.ListenConcurrency > 0 {
-		log.Infof("入站 fasthttp 最大并发连接: %d", cfg.ListenConcurrency)
+		log.Infof("入站最大并发连接: %d", cfg.ListenConcurrency)
 	}
 	if cfg.UpstreamResponseHeaderTimeoutSec > 0 {
 		log.Infof("出站响应头超时: %d 秒", cfg.UpstreamResponseHeaderTimeoutSec)
@@ -216,7 +206,6 @@ func main() {
 	codexcatalog.StartAutoRefresh(ctx)
 
 	if cfg.StartupAsyncLoad {
-		log.Infof("启动即服务可用: 已启用后台账号加载模式")
 		go func() {
 			start := time.Now()
 			batch := cfg.StartupLoadBatchSize
@@ -238,9 +227,9 @@ func main() {
 					}
 					n := manager.AccountCount()
 					if n > 0 {
-						log.Warnf("启动分批加载报错: %v（号池当前 %d 个，选号直接读号池；%d 秒后重试本流程）", loadErr, n, retrySec)
+						log.Debugf("启动分批加载报错: %v（号池当前 %d 个，选号直接读号池；%d 秒后重试本流程）", loadErr, n, retrySec)
 					} else {
-						log.Warnf("后台加载账号失败: %v，%d 秒后重试", loadErr, retrySec)
+						log.Debugf("后台加载账号失败: %v，%d 秒后重试", loadErr, retrySec)
 					}
 					select {
 					case <-ctx.Done():
@@ -249,7 +238,7 @@ func main() {
 					}
 					continue
 				}
-				log.Infof("后台加载账号完成: 共 %d 个，耗时 %v", manager.AccountCount(), time.Since(start).Round(time.Millisecond))
+				log.Infof("账号后台加载完成: 共 %d 个，耗时 %v", manager.AccountCount(), time.Since(start).Round(time.Millisecond))
 				return
 			}
 		}()
@@ -260,14 +249,8 @@ func main() {
 		}
 		log.Infof("账号加载完成: 共 %d 个，耗时 %v", manager.AccountCount(), time.Since(loadStart).Round(time.Millisecond))
 	}
-
-	/* 启动异步磁盘写入工作器（将 Token 写盘从刷新 goroutine 解耦） */
 	manager.StartSaveWorker(ctx)
-
-	/* 启动后台 Token 刷新 */
 	go manager.StartRefreshLoop(ctx)
-
-	/* 延迟启动健康检查（在服务启动后异步进行，避免影响启动速度） */
 	if cfg.HealthCheckInterval > 0 {
 		go func() {
 			// 等待服务完全启动
@@ -324,10 +307,7 @@ func main() {
 		HTTP2MaxConnsPerHostCap:  cfg.HTTP2MaxConnsPerHostCap,
 		ResponseHeaderTimeoutSec: cfg.UpstreamResponseHeaderTimeoutSec,
 	})
-
-	/* 延迟启动连接池保活（在服务启动后异步进行） */
 	go func() {
-		// 短暂延迟，让HTTP服务先启动
 		time.Sleep(100 * time.Millisecond)
 		exec.StartKeepAlive(ctx)
 	}()
@@ -343,8 +323,6 @@ func main() {
 	appHandler = handler.CORSAllowOrigin(appHandler)
 	appHandler = handler.GzipIfAccepted(appHandler)
 	appHandler = fasthttpLogger(appHandler)
-
-	/* Read/WriteTimeout=0：长 SSE 对话不在服务端掐写回；IdleTimeout 用 listen-idle-timeout-sec，勿与 shutdown-timeout 混用 */
 	srv := &fasthttp.Server{
 		Handler:          appHandler,
 		Name:             "Codex Proxy",
@@ -353,7 +331,6 @@ func main() {
 		IdleTimeout:      time.Duration(cfg.ListenIdleTimeoutSec) * time.Second,
 		ReadTimeout:      0,
 		WriteTimeout:     0,
-		/* fasthttp 无单独「读头」超时；此处按配置限制单次请求的读（含 body），与 listen-read-header-timeout-sec 语义接近 */
 		HeaderReceived: func(_ *fasthttp.RequestHeader) fasthttp.RequestConfig {
 			return fasthttp.RequestConfig{
 				ReadTimeout: time.Duration(cfg.ListenReadHeaderTimeoutSec) * time.Second,
@@ -365,13 +342,8 @@ func main() {
 		MaxConnsPerIP:      0,
 		MaxRequestsPerConn: 0,
 	}
-
-	/* 在 goroutine 中启动 HTTP 服务 */
 	go func() {
-		log.Infof("%s⚡ Codex Proxy 已启动%s，共 %s%d%s 个账号，监听 %s%s%s",
-			colorCyan, colorReset,
-			colorGreen, manager.AccountCount(), colorReset,
-			colorGreen, cfg.Listen, colorReset)
+		log.Infof("Codex Proxy 已启动，共 %d 个账号，监听 %s", manager.AccountCount(), cfg.Listen)
 		if err := srv.ListenAndServe(cfg.Listen); err != nil {
 			log.Fatalf("HTTP 服务启动失败: %v", err)
 		}
@@ -382,7 +354,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Infof("%s收到关闭信号，正在停止...%s", colorYellow, colorReset)
+	log.Info("收到关闭信号，正在停止")
 
 	/* 优雅关闭 HTTP 服务器 */
 	shutdownSec := cfg.ShutdownTimeout
@@ -397,59 +369,35 @@ func main() {
 	cancel()
 	manager.Stop()
 
-	log.Infof("%s✅ Codex Proxy 已停止%s", colorGreen, colorReset)
+	log.Info("Codex Proxy 已停止")
 }
 
 /**
- * fasthttpLogger 自定义 FastHTTP 日志中间件（彩色输出）
+ * fasthttpLogger 自定义 FastHTTP 日志中间件
  */
 func fasthttpLogger(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
+		requestID := fmt.Sprintf("req-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&requestSeq, 1))
 		start := time.Now()
 		next(ctx)
 
 		status := ctx.Response.StatusCode()
 		latency := time.Since(start)
-		method := string(ctx.Method())
-		path := string(ctx.Path())
-		client := ctx.RemoteAddr().String()
-
-		statusColor := colorGreen
+		entry := log.WithFields(log.Fields{
+			"request_id":  requestID,
+			"method":      string(ctx.Method()),
+			"path":        string(ctx.Path()),
+			"status":      status,
+			"latency_ms":  latency.Round(time.Millisecond).Milliseconds(),
+			"remote_addr": ctx.RemoteAddr().String(),
+		})
 		switch {
 		case status >= 500:
-			statusColor = colorRed
+			entry.Error("http request")
 		case status >= 400:
-			statusColor = colorYellow
-		case status >= 300:
-			statusColor = colorCyan
-		}
-
-		methodColor := colorBlue
-		switch method {
-		case "POST":
-			methodColor = colorCyan
-		case "DELETE":
-			methodColor = colorRed
-		case "PUT", "PATCH":
-			methodColor = colorYellow
-		}
-
-		if status >= 400 {
-			log.Warnf("%s%s%s %s%d%s %s%s%s %s%v%s %s",
-				methodColor, method, colorReset,
-				statusColor, status, colorReset,
-				colorWhite, path, colorReset,
-				colorGray, latency.Round(time.Millisecond), colorReset,
-				fmt.Sprintf("%s%s%s", colorGray, client, colorReset),
-			)
-		} else {
-			log.Debugf("%s%s%s %s%d%s %s%s%s %s%v%s %s",
-				methodColor, method, colorReset,
-				statusColor, status, colorReset,
-				colorWhite, path, colorReset,
-				colorGray, latency.Round(time.Millisecond), colorReset,
-				fmt.Sprintf("%s%s%s", colorGray, client, colorReset),
-			)
+			entry.Warn("http request")
+		default:
+			entry.Debug("http request")
 		}
 	}
 }
@@ -470,7 +418,7 @@ func exportAccountsToJSON(cfg *config.Config) error {
 		return fmt.Errorf("创建 auth-dir 目录失败: %v", err)
 	}
 
-	log.Infof("%s📤 开始导出账号到 JSON...%s", colorCyan, colorReset)
+	log.Info("开始导出账号到 JSON")
 
 	/* 连接数据库 */
 	db, dialect, err := codexdb.Open(cfg)
@@ -543,7 +491,7 @@ func exportAccountsToJSON(cfg *config.Config) error {
 		successCount++
 	}
 
-	log.Infof("%s✅ 导出完成: 成功 %d 个，失败 %d 个%s", colorGreen, successCount, failCount, colorReset)
+	log.Infof("导出完成: 成功 %d 个，失败 %d 个", successCount, failCount)
 	return nil
 }
 

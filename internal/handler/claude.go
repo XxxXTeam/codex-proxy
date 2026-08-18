@@ -72,6 +72,15 @@ func pumpClaudeCodexSSE(s *executor.CodexResponsesStream, w io.Writer, flush fun
 		}
 		if state.MessageStartEmitted || state.Completed {
 			if acc := s.StreamAccount(); acc != nil {
+				acc.RecordUsageDetailed(
+					s.BaseModel,
+					state.InputTokens,
+					state.OutputTokens,
+					state.TotalTokens,
+					state.CacheReadTokens,
+					state.CacheWriteTokens,
+					state.ReasoningTokens,
+				)
 				acc.RecordSuccess()
 			}
 			return nil
@@ -88,6 +97,15 @@ func pumpClaudeCodexSSE(s *executor.CodexResponsesStream, w io.Writer, flush fun
 		}
 	}
 	if acc := s.StreamAccount(); acc != nil {
+		acc.RecordUsageDetailed(
+			s.BaseModel,
+			state.InputTokens,
+			state.OutputTokens,
+			state.TotalTokens,
+			state.CacheReadTokens,
+			state.CacheWriteTokens,
+			state.ReasoningTokens,
+		)
 		acc.RecordSuccess()
 	}
 	return nil
@@ -109,7 +127,7 @@ func (h *ProxyHandler) handleMessages(ctx *fasthttp.RequestCtx) {
 		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_request_error", "缺少 model 字段")
 		return
 	}
-	if err := h.validateModelSuffixOptions(model); err != nil {
+	if err := h.validateModelRequestOptions(model, body); err != nil {
 		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -131,6 +149,47 @@ func (h *ProxyHandler) handleMessages(ctx *fasthttp.RequestCtx) {
 			RecordRequest()
 		}
 	}
+}
+
+/**
+ * handleMessageCountTokens 处理 Claude Messages Token Count 请求（/v1/messages/count_tokens）
+ * 本地按 Claude 请求结构估算输入 token，不创建消息响应
+ */
+func (h *ProxyHandler) handleMessageCountTokens(ctx *fasthttp.RequestCtx) {
+	body := ctx.PostBody()
+	if len(body) == 0 {
+		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_request_error", "读取请求体失败")
+		return
+	}
+
+	if err := translator.ValidateClaudeCountTokensRequest(body); err != nil {
+		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	model := gjson.GetBytes(body, "model").String()
+	if err := h.validateModelRequestOptions(model, body); err != nil {
+		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	count, err := translator.CountClaudeInputTokens(body)
+	if err != nil {
+		sendClaudeError(ctx, fasthttp.StatusInternalServerError, "api_error", fmt.Sprintf("计算输入 token 失败: %v", err))
+		return
+	}
+
+	payload := map[string]any{
+		"input_tokens": count,
+	}
+	if gjson.GetBytes(body, "context_management").Exists() {
+		payload["context_management"] = map[string]any{
+			"original_input_tokens": 0,
+		}
+	}
+
+	writeJSON(ctx, fasthttp.StatusOK, payload)
+	RecordRequest()
 }
 
 /**
@@ -210,6 +269,15 @@ func (h *ProxyHandler) executeClaudeNonStream(ctx *fasthttp.RequestCtx, rc execu
 		return executor.ErrEmptyResponse
 	}
 
+	account.RecordUsageDetailed(
+		model,
+		result.InputTokens,
+		result.OutputTokens,
+		result.TotalTokens,
+		result.CacheReadTokens,
+		result.CacheWriteTokens,
+		result.ReasoningTokens,
+	)
 	account.RecordSuccess()
 	ctx.Response.Header.Set("Content-Type", "application/json")
 	ctx.SetStatusCode(fasthttp.StatusOK)

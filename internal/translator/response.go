@@ -8,6 +8,8 @@ package translator
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -42,6 +44,7 @@ type StreamState struct {
 	HasText                  bool
 	HasToolCall              bool
 	HasReasoning             bool
+	HasImage                 bool
 	Completed                bool
 	HasReceivedArgsDelta     bool
 	HasToolCallAnnounced     bool
@@ -49,6 +52,11 @@ type StreamState struct {
 	UsageInput               int64
 	UsageOutput              int64
 	UsageTotal               int64
+	UsageCacheRead           int64
+	UsageCacheWrite          int64
+	UsageReasoning           int64
+	imageIndex               int
+	seenImagePayloads        map[string]bool
 	reasoningDeltaByItem     map[string]string
 	hasReasoningSummaryDelta bool
 
@@ -80,8 +88,8 @@ func (s *StreamState) EmptyUpstreamDiag(pumpScanLines int) string {
 	if s == nil {
 		return "state=nil"
 	}
-	base := fmt.Sprintf("upstream_scan_lines=%d upstream_data_events=%d first_type=%q last_type=%q response_id=%q codex_completed=%v mapped(text=%v tool=%v reasoning=%v)",
-		pumpScanLines, s.diagUpstreamDataLines, s.diagFirstEventType, s.diagLastEventType, s.ResponseID, s.Completed, s.HasText, s.HasToolCall, s.HasReasoning)
+	base := fmt.Sprintf("upstream_scan_lines=%d upstream_data_events=%d first_type=%q last_type=%q response_id=%q codex_completed=%v mapped(text=%v tool=%v reasoning=%v image=%v)",
+		pumpScanLines, s.diagUpstreamDataLines, s.diagFirstEventType, s.diagLastEventType, s.ResponseID, s.Completed, s.HasText, s.HasToolCall, s.HasReasoning, s.HasImage)
 	if s.UpstreamErrCode != "" || s.UpstreamErrMsg != "" {
 		msg := s.UpstreamErrMsg
 		const maxMsg = 240
@@ -103,6 +111,51 @@ func NewStreamState(model string) *StreamState {
 		Model:             model,
 		FunctionCallIndex: -1,
 	}
+}
+
+func mimeTypeFromCodexOutputFormat(outputFormat string) string {
+	outputFormat = strings.TrimSpace(outputFormat)
+	if strings.Contains(outputFormat, "/") {
+		return outputFormat
+	}
+	switch strings.ToLower(outputFormat) {
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	case "gif":
+		return "image/gif"
+	default:
+		return "image/png"
+	}
+}
+
+func chatImagePayload(index int, b64, outputFormat string) string {
+	payload := `{"type":"image_url","image_url":{"url":""}}`
+	payload, _ = sjson.Set(payload, "index", index)
+	payload, _ = sjson.Set(payload, "image_url.url", "data:"+mimeTypeFromCodexOutputFormat(outputFormat)+";base64,"+b64)
+	return payload
+}
+
+func (s *StreamState) appendStreamImage(tpl, b64, outputFormat string) (string, bool) {
+	if s == nil || strings.TrimSpace(b64) == "" {
+		return tpl, false
+	}
+	if s.seenImagePayloads == nil {
+		s.seenImagePayloads = make(map[string]bool)
+	}
+	hash := sha256.Sum256([]byte(b64))
+	key := hex.EncodeToString(hash[:])
+	if s.seenImagePayloads[key] {
+		return tpl, false
+	}
+	s.seenImagePayloads[key] = true
+	s.HasImage = true
+	tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
+	tpl, _ = sjson.SetRaw(tpl, "choices.0.delta.images", `[]`)
+	tpl, _ = sjson.SetRaw(tpl, "choices.0.delta.images.-1", chatImagePayload(s.imageIndex, b64, outputFormat))
+	s.imageIndex++
+	return tpl, true
 }
 
 /**
@@ -143,6 +196,9 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		}
 		state.reasoningDeltaByItem = nil
 		state.HasReasoning = false
+		state.HasImage = false
+		state.imageIndex = 0
+		state.seenImagePayloads = nil
 		state.hasReasoningSummaryDelta = false
 		tpl := `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null}]}`
 		tpl, _ = sjson.Set(tpl, "id", state.ResponseID)
@@ -251,6 +307,13 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 			}
 		}
 
+	case "response.image_generation_call.partial_image":
+		var emitted bool
+		tpl, emitted = state.appendStreamImage(tpl, root.Get("partial_image_b64").String(), root.Get("output_format").String())
+		if !emitted {
+			return nil
+		}
+
 	case "response.output_text.delta":
 		delta := root.Get("delta").String()
 		if delta == "" {
@@ -262,8 +325,23 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 
 	case "response.completed":
 		state.Completed = true
+		usage := root.Get("response.usage")
+		if usage.Exists() {
+			state.UsageInput = usage.Get("input_tokens").Int()
+			state.UsageOutput = usage.Get("output_tokens").Int()
+			state.UsageTotal = usage.Get("total_tokens").Int()
+			state.UsageCacheRead = usage.Get("input_tokens_details.cached_tokens").Int()
+			state.UsageReasoning = usage.Get("output_tokens_details.reasoning_tokens").Int()
+			state.UsageCacheWrite = usage.Get("input_tokens_details.cache_write_tokens").Int()
+			if state.UsageCacheWrite == 0 {
+				state.UsageCacheWrite = usage.Get("cache_write_tokens").Int()
+			}
+			if state.UsageCacheWrite == 0 {
+				state.UsageCacheWrite = usage.Get("cache_creation_input_tokens").Int()
+			}
+		}
 		/* 上游已 completed 但无任何正文/工具/思维：不向客户端发 finish_reason chunk，由 executor 按空流换号，避免 chunkCount>0 阻断重试 */
-		if !state.HasText && !state.HasToolCall && !state.HasReasoning {
+		if !state.HasText && !state.HasToolCall && !state.HasReasoning && !state.HasImage {
 			return nil
 		}
 		finishReason := "stop"
@@ -273,10 +351,7 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", finishReason)
 
 		/* usage 只在 response.completed 事件中存在，提取并存入 state */
-		if usage := root.Get("response.usage"); usage.Exists() {
-			state.UsageInput = usage.Get("input_tokens").Int()
-			state.UsageOutput = usage.Get("output_tokens").Int()
-			state.UsageTotal = usage.Get("total_tokens").Int()
+		if usage.Exists() {
 			if !usageFinalSeparateChunk {
 				if v := usage.Get("output_tokens"); v.Exists() {
 					tpl, _ = sjson.Set(tpl, "usage.completion_tokens", v.Int())
@@ -342,7 +417,18 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 
 	case "response.output_item.done":
 		item := root.Get("item")
-		if !item.Exists() || item.Get("type").String() != "function_call" {
+		if !item.Exists() {
+			return nil
+		}
+		if item.Get("type").String() == "image_generation_call" {
+			var emitted bool
+			tpl, emitted = state.appendStreamImage(tpl, item.Get("result").String(), item.Get("output_format").String())
+			if !emitted {
+				return nil
+			}
+			return []string{tpl}
+		}
+		if item.Get("type").String() != "function_call" {
 			return nil
 		}
 		state.HasToolCall = true
@@ -479,6 +565,8 @@ func ConvertNonStreamResponse(rawJSON []byte, reverseToolMap map[string]string) 
 	if output.IsArray() {
 		var contentBuilder strings.Builder
 		var toolCalls []string
+		var images []string
+		seenImages := make(map[string]bool)
 
 		for _, item := range output.Array() {
 			switch item.Get("type").String() {
@@ -534,6 +622,19 @@ func ConvertNonStreamResponse(rawJSON []byte, reverseToolMap map[string]string) 
 						}
 					}
 				}
+			case "image_generation_call":
+				b64 := item.Get("result").String()
+				if b64 == "" {
+					break
+				}
+				outputFormat := item.Get("output_format").String()
+				hash := sha256.Sum256([]byte(b64))
+				key := hex.EncodeToString(hash[:])
+				if seenImages[key] {
+					break
+				}
+				seenImages[key] = true
+				images = append(images, chatImagePayload(len(images), b64, outputFormat))
 			case "function_call":
 				fc := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
 				if v := item.Get("call_id"); v.Exists() {
@@ -570,6 +671,13 @@ func ConvertNonStreamResponse(rawJSON []byte, reverseToolMap map[string]string) 
 				tpl, _ = sjson.SetRaw(tpl, "choices.0.message.tool_calls.-1", tc)
 			}
 		}
+		if len(images) > 0 {
+			hasOutput = true
+			tpl, _ = sjson.SetRaw(tpl, "choices.0.message.images", `[]`)
+			for _, image := range images {
+				tpl, _ = sjson.SetRaw(tpl, "choices.0.message.images.-1", image)
+			}
+		}
 	}
 	/* 仅有顶层 reasoning（无 output 数组或 output 为空）时也写入 reasoning_content */
 	if reasoningBuilder.Len() > 0 && gjson.Get(tpl, "choices.0.message.reasoning_content").String() == "" {
@@ -579,7 +687,8 @@ func ConvertNonStreamResponse(rawJSON []byte, reverseToolMap map[string]string) 
 
 	/* finish_reason */
 	if resp.Get("status").String() == "completed" {
-		if gjson.Get(tpl, "choices.0.message.tool_calls").Exists() {
+		toolCalls := gjson.Get(tpl, "choices.0.message.tool_calls")
+		if toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
 			tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", "tool_calls")
 		} else {
 			tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", "stop")

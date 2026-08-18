@@ -83,6 +83,9 @@ export function buildDashboard(stats: StatsResponse | null) {
   const tokenMix = [
     { label: "输入", value: summary?.total_input_tokens ?? 0 },
     { label: "输出", value: summary?.total_output_tokens ?? 0 },
+    { label: "缓存读取", value: summary?.total_cache_read_tokens ?? 0 },
+    { label: "缓存写入", value: summary?.total_cache_write_tokens ?? 0 },
+    { label: "推理", value: summary?.total_reasoning_tokens ?? 0 },
   ]
 
   return {

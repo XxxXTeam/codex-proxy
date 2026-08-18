@@ -43,23 +43,32 @@ func ParseModelSuffix(model string) ParseResult {
 
 	result := ParseResult{}
 	lower := strings.ToLower(model)
-	if strings.HasSuffix(lower, "-fast") && len(model) > 5 {
-		result.IsFast = true
-		result.ServiceTier = "fast"
-		model = model[:len(model)-5]
-		lower = strings.ToLower(model)
-	}
-	if strings.HasSuffix(lower, "-image") && len(model) > 6 {
-		result.IsImage = true
-		model = model[:len(model)-6]
-		lower = strings.ToLower(model)
-	}
-	if !result.IsImage {
+	for {
+		changed := false
+		if strings.HasSuffix(lower, "-fast") && len(model) > 5 {
+			result.IsFast = true
+			result.ServiceTier = "fast"
+			model = model[:len(model)-5]
+			lower = strings.ToLower(model)
+			changed = true
+		}
+		if strings.HasSuffix(lower, "-image") && len(model) > 6 {
+			result.IsImage = true
+			model = model[:len(model)-6]
+			lower = strings.ToLower(model)
+			changed = true
+		}
 		if strings.HasSuffix(lower, "-1m") && len(model) > 3 {
 			result.Is1M = true
 			model = model[:len(model)-3]
 			lower = strings.ToLower(model)
+			changed = true
 		}
+		if !changed {
+			break
+		}
+	}
+	if !result.IsImage {
 		lastDash := strings.LastIndex(model, "-")
 		if lastDash > 0 && lastDash < len(model)-1 {
 			tail := strings.ToLower(model[lastDash+1:])

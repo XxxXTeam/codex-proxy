@@ -49,6 +49,35 @@ func sanitizeClaudeToolID(id string) string {
 	return s
 }
 
+func claudeUsageCacheWriteTokens(usage gjson.Result) int64 {
+	for _, path := range []string{
+		"input_tokens_details.cache_write_tokens",
+		"cache_write_tokens",
+		"cache_creation_input_tokens",
+	} {
+		value := usage.Get(path).Int()
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func claudeUsageReasoningTokens(usage gjson.Result) int64 {
+	for _, path := range []string{
+		"output_tokens_details.reasoning_tokens",
+		"reasoning_tokens",
+		"output_tokens_details.thinking_tokens",
+		"thinking_tokens",
+	} {
+		value := usage.Get(path).Int()
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
 /**
  * ConvertClaudeRequestToOpenAI 将 Claude Messages API 请求转换为 OpenAI Chat Completions 格式
  * 转换后可复用现有的 OpenAI → Codex 转换链
@@ -276,6 +305,11 @@ type ClaudeStreamState struct {
 	MessageID           string
 	Model               string
 	InputTokens         int64
+	OutputTokens        int64
+	TotalTokens         int64
+	CacheReadTokens     int64
+	CacheWriteTokens    int64
+	ReasoningTokens     int64
 	ContentBlockIndex   int
 	HasStartedContent   bool
 	HasText             bool
@@ -480,6 +514,15 @@ func ConvertCodexStreamToClaudeEvents(rawLine []byte, state *ClaudeStreamState) 
 
 	case "response.completed":
 		state.Completed = true
+		usage := root.Get("response.usage")
+		if usage.Exists() {
+			state.InputTokens = usage.Get("input_tokens").Int()
+			state.OutputTokens = usage.Get("output_tokens").Int()
+			state.TotalTokens = usage.Get("total_tokens").Int()
+			state.CacheReadTokens = usage.Get("input_tokens_details.cached_tokens").Int()
+			state.CacheWriteTokens = claudeUsageCacheWriteTokens(usage)
+			state.ReasoningTokens = claudeUsageReasoningTokens(usage)
+		}
 		if state.InThinkingBlock {
 			blockStop := `{}`
 			blockStop, _ = sjson.Set(blockStop, "type", "content_block_stop")
@@ -500,14 +543,21 @@ func ConvertCodexStreamToClaudeEvents(rawLine []byte, state *ClaudeStreamState) 
 		if state.HasToolUse {
 			stopReason = "tool_use"
 		}
-		outputTokens := root.Get("response.usage.output_tokens").Int()
 
 		msgDelta := `{}`
 		msgDelta, _ = sjson.Set(msgDelta, "type", "message_delta")
 		delta := `{}`
 		delta, _ = sjson.Set(delta, "stop_reason", stopReason)
 		msgDelta, _ = sjson.SetRaw(msgDelta, "delta", delta)
-		msgDelta, _ = sjson.Set(msgDelta, "usage.output_tokens", outputTokens)
+		msgDelta, _ = sjson.Set(msgDelta, "usage.input_tokens", state.InputTokens)
+		msgDelta, _ = sjson.Set(msgDelta, "usage.output_tokens", state.OutputTokens)
+		msgDelta, _ = sjson.Set(msgDelta, "usage.total_tokens", state.TotalTokens)
+		if state.CacheReadTokens > 0 {
+			msgDelta, _ = sjson.Set(msgDelta, "usage.cache_read_input_tokens", state.CacheReadTokens)
+		}
+		if state.CacheWriteTokens > 0 {
+			msgDelta, _ = sjson.Set(msgDelta, "usage.cache_creation_input_tokens", state.CacheWriteTokens)
+		}
 		events = append(events, formatClaudeSSE("message_delta", msgDelta))
 
 		/* message_stop */
@@ -663,20 +713,37 @@ func ConvertCodexNonStreamToClaudeResponse(rawJSON []byte, model string) string 
 	if usage := resp.Get("usage"); usage.Exists() {
 		out, _ = sjson.Set(out, "usage.input_tokens", usage.Get("input_tokens").Int())
 		out, _ = sjson.Set(out, "usage.output_tokens", usage.Get("output_tokens").Int())
+		out, _ = sjson.Set(out, "usage.total_tokens", usage.Get("total_tokens").Int())
+		if cached := usage.Get("input_tokens_details.cached_tokens").Int(); cached > 0 {
+			out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cached)
+		}
+		if cacheWrite := claudeUsageCacheWriteTokens(usage); cacheWrite > 0 {
+			out, _ = sjson.Set(out, "usage.cache_creation_input_tokens", cacheWrite)
+		}
+		if reasoning := claudeUsageReasoningTokens(usage); reasoning > 0 {
+			out, _ = sjson.Set(out, "usage.reasoning_tokens", reasoning)
+		}
 	} else {
 		out, _ = sjson.Set(out, "usage.input_tokens", 0)
 		out, _ = sjson.Set(out, "usage.output_tokens", 0)
+		out, _ = sjson.Set(out, "usage.total_tokens", 0)
 	}
 
 	return out
 }
 
 type ClaudeNonStreamResult struct {
-	JSON           string
-	FoundCompleted bool
-	HasText        bool
-	HasToolUse     bool
-	HasThinking    bool
+	JSON             string
+	FoundCompleted   bool
+	HasText          bool
+	HasToolUse       bool
+	HasThinking      bool
+	InputTokens      int64
+	OutputTokens     int64
+	TotalTokens      int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	ReasoningTokens  int64
 }
 
 func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byte, model string) ClaudeNonStreamResult {
@@ -715,12 +782,19 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
 			}
 		}
 
+		usage := gjson.GetBytes(jsonData, "response.usage")
 		return ClaudeNonStreamResult{
-			JSON:           ConvertCodexNonStreamToClaudeResponse(jsonData, model),
-			FoundCompleted: true,
-			HasText:        hasText,
-			HasToolUse:     hasToolUse,
-			HasThinking:    hasThinking,
+			JSON:             ConvertCodexNonStreamToClaudeResponse(jsonData, model),
+			FoundCompleted:   true,
+			HasText:          hasText,
+			HasToolUse:       hasToolUse,
+			HasThinking:      hasThinking,
+			InputTokens:      usage.Get("input_tokens").Int(),
+			OutputTokens:     usage.Get("output_tokens").Int(),
+			TotalTokens:      usage.Get("total_tokens").Int(),
+			CacheReadTokens:  usage.Get("input_tokens_details.cached_tokens").Int(),
+			CacheWriteTokens: claudeUsageCacheWriteTokens(usage),
+			ReasoningTokens:  claudeUsageReasoningTokens(usage),
 		}
 	}
 	return ClaudeNonStreamResult{}

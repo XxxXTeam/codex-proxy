@@ -25,6 +25,9 @@ export type AccountStats = {
     input_tokens: number
     output_tokens: number
     total_tokens: number
+    cache_read_tokens: number
+    cache_write_tokens: number
+    reasoning_tokens: number
   }
   quota?: {
     valid: boolean
@@ -34,6 +37,17 @@ export type AccountStats = {
   }
 }
 
+export type CatalogStatus = {
+  client_version: string
+  revision: number
+  model_count: number
+  updated_at?: string
+  source?: string
+  refresh_interval_sec: number
+  last_checked_at?: string
+  last_error?: string
+}
+
 export type StatsResponse = {
   summary: {
     total: number
@@ -41,9 +55,19 @@ export type StatsResponse = {
     cooldown: number
     disabled: number
     rpm: number
+    total_completions: number
     total_input_tokens: number
     total_output_tokens: number
+    total_cache_read_tokens: number
+    total_cache_write_tokens: number
+    total_reasoning_tokens: number
+    total_tokens: number
+    quota_checked: number
+    quota_valid: number
+    quota_invalid: number
+    quota_exhausted: number
   }
+  catalog: CatalogStatus
   accounts: AccountStats[]
   pagination?: {
     page: number
@@ -223,6 +247,19 @@ export async function fetchStats(
   })
   if (!response.ok) throw await responseError(response)
   return (await response.json()) as StatsResponse
+}
+
+export async function refreshCatalog(
+  credentials: Credentials,
+  signal?: AbortSignal
+) {
+  const response = await fetch(endpointUrl(credentials, "/admin/catalog/refresh"), {
+    method: "POST",
+    headers: authHeaders(credentials),
+    signal,
+  })
+  if (!response.ok) throw await responseError(response)
+  return (await response.json()) as { catalog: CatalogStatus }
 }
 
 export async function runProgressStream(

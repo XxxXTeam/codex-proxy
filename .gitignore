@@ -1,33 +1,20 @@
-# 账号文件（含 Token 敏感信息）
 auths/
-
 .gocache/
-
-# 配置文件（含 API Key 等敏感信息）
 config.yaml
-
-# 编译产物
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 app
-
-# 参考项目
-CLIProxyAPIPlus/
-
-*_test.go
-
-# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
-# 系统文件
 .DS_Store
 Thumbs.db
-.serena/project.yml
+.serena/
 codex-proxy
+logs/
+.claude/

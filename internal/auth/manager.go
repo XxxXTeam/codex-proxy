@@ -647,7 +647,7 @@ func accountFromTokenFile(tf *TokenFile, logicalPath string) (*Account, error) {
 	}
 	accountID := tf.AccountID
 	email := tf.Email
-	var planType string
+	planType := strings.TrimSpace(tf.PlanType)
 	if tf.IDToken != "" {
 		jwtAccountID, jwtEmail, jwtPlan := parseIDTokenClaims(tf.IDToken)
 		if accountID == "" {
@@ -656,7 +656,9 @@ func accountFromTokenFile(tf *TokenFile, logicalPath string) (*Account, error) {
 		if email == "" {
 			email = jwtEmail
 		}
-		planType = jwtPlan
+		if strings.TrimSpace(jwtPlan) != "" {
+			planType = strings.TrimSpace(jwtPlan)
+		}
 	}
 	acc := &Account{
 		FilePath: logicalPath,

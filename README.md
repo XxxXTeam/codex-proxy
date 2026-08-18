@@ -30,7 +30,7 @@ Codex API 代理服务，提供 OpenAI / Claude 多协议兼容接口，支持�
 - **额度查询** — 支持查询每个账号的剩余额度，按额度使用率排序选号
 - **热加载** — 运行时自动扫描新增账号文件，无需重启
 - **禁用凭据周期清理（磁盘）** — 默认按间隔恢复 `*.json.disabled` 并探测，失败则删文件，减轻目录膨胀（`disabled-recovery-interval-sec`，`0` 关闭）
-- **Codex 客户端目录** — 自动刷新远端 Codex 客户端模型目录，`GET /v1/models?client_version=...` 返回最新 reasoning 等级和客户端版本信息
+- **Codex 客户端目录** — 自动刷新远端 Codex 客户端模型目录，`GET /v1/models?client_version=...` 返回最新 reasoning 等级和客户端版本信息；`/stats` 提供目录 revision、来源、模型数量和更新时间，`POST /admin/catalog/refresh` 可手动刷新
 - **Tool Schema 自动修复** — 自动补全 `type: array` 缺少 `items` 的 JSON Schema，避免上游 400 错误
 - **连接池保活** — 定时 ping 上游保持 TCP+TLS 连接，消除冷启动延迟
 - **API Key 鉴权** — 可选的访问密钥保护
@@ -198,6 +198,7 @@ curl http://localhost:8080/v1/messages \
 |------|------|------|
 | POST | `/v1/chat/completions` | Chat Completions（流式/非流式） |
 | POST | `/v1/responses` | Responses API（流式/非流式） |
+| GET | `/v1/responses` | Responses WebSocket（`response.create` / `response.append`） |
 | POST | `/v1/responses/compact` | Responses Compact API（对话历史压缩） |
 | POST | `/v1/messages` | Claude Messages API（流式/非流式） |
 | GET | `/v1/models` | 模型列表（支持 `?client_version=...` 返回 Codex 客户端目录） |
@@ -208,6 +209,9 @@ curl http://localhost:8080/v1/messages \
 | POST | `/check-quota` | 查询所有账号额度 |
 | POST | `/admin/accounts/ingest` | 导入账号：请求体为单个对象、JSON 数组或 NDJSON；与磁盘 `*.json` / 数据库 upsert 一致 |
 | GET / POST | `/admin/accounts/ingest` | 与上同一路径，带 `Upgrade: websocket` 时通过 WebSocket 文本帧逐条导入 |
+| POST | `/admin/catalog/refresh` | 手动刷新 Codex 客户端模型目录缓存（需管理接口鉴权配置） |
+
+**Responses WebSocket**：通过 `GET /v1/responses` 升级，文本帧支持 `response.create`（兼容顶层字段和嵌套 `response` 对象）及 `response.append`。代理仍使用上游 HTTP/SSE，再转换为下游 WebSocket；同一连接会记录最近模型和响应 ID，用于增量请求。
 
 **管理类接口**（鉴权、请求体、curl / WS 示例、安全注意）详见 **[docs/API-ADMIN.md](docs/API-ADMIN.md)**。
 

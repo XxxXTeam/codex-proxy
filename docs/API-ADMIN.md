@@ -20,6 +20,9 @@ Authorization: Bearer <与 api-keys 中某一项完全一致>
 | POST | `/recover-auth` | 401 恢复：按邮箱/路径/全部同步刷新；失败可能将凭据重命名为 `*.json.disabled` |
 | POST | `/admin/accounts/ingest` | **导入账号**：HTTP 上传 JSON 填充号池（见下文） |
 | GET 或 POST | `/admin/accounts/ingest` | 同上路径，带 **`Upgrade: websocket`** 时使用 **WebSocket** 导入（见下文） |
+| POST | `/admin/catalog/refresh` | 手动刷新 Codex 客户端模型目录缓存 |
+
+`/stats` 响应同时包含 `catalog` 状态对象：`client_version`、`model_count`、`revision`、`updated_at`、`source`、`refresh_interval_sec`、`last_checked_at` 与最近一次刷新错误。
 
 对话相关接口（`/v1/*`）的鉴权规则相同：配置了 `api-keys` 则必须带 Bearer。
 

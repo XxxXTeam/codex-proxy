@@ -323,6 +323,7 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) (verdict
 		acc.QuotaInfo = info
 		acc.QuotaCheckedAt = now
 		acc.mu.Unlock()
+		acc.RefreshUsedPercent()
 
 		log.Debugf("账号 [%s] 额度查询成功", email)
 		return 1, 200
