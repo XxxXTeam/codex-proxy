@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.12.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.11.0...v1.12.0) (2026-08-19)
+
+
+### ✨ 新功能
+
+* 完善指纹配置，支持收敛会话信息 ([ad69900](https://github.com/XxxXTeam/codex-proxy/commit/ad69900d6a89542636e60b1e563e0be08e1eec85))
+
+
+### 🐛 错误修复
+
+* 修复工作流错误 ([62378d4](https://github.com/XxxXTeam/codex-proxy/commit/62378d404adbda67937ac2b8e6c0fe64d1a82fb9))
+
 ## [1.11.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.10.0...v1.11.0) (2026-08-18)
 
 
