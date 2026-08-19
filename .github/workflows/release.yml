@@ -65,7 +65,7 @@ jobs:
 
       - name: 安装前端依赖
         working-directory: web
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: 构建嵌入前端
         working-directory: web

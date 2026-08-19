@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 
 RUN --mount=type=cache,target=/root/.npm \
-    npm ci --prefix web && npm run build --prefix web
+    npm install --prefix web --no-audit --no-fund && npm run build --prefix web
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \

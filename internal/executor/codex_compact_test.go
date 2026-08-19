@@ -24,7 +24,7 @@ func TestRecordCompactUsage(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			account := &auth.Account{}
-			recordCompactUsage(account, "gpt-5.6-sol-openai-compact", []byte(test.body))
+			recordCompactUsage(account, "gpt-5.6-sol-openai-compact", []byte(test.body), false)
 
 			usage := account.GetStats().Usage
 			if usage.TotalCompletions != 1 || usage.InputTokens != 12 || usage.OutputTokens != 8 || usage.TotalTokens != 20 {
