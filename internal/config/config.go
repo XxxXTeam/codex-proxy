@@ -8,16 +8,25 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 
 	"codex-proxy/internal/netutil"
 
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
 
 /* DefaultDisabledRecoveryIntervalSec 仅磁盘凭据：周期性恢复 *.json.disabled 并探测 OAuth/额度，失败则删文件，减少残留占盘。YAML 省略本项时使用。设为 0 关闭。 */
 const DefaultDisabledRecoveryIntervalSec = 3600
+
+// PromptCacheReplacement 是对稳定 system/developer 提示词执行的显式正则替换规则。
+// Pattern 与 Replace 均由配置文件提供，规则只在启用 prompt-cache-optimize-enabled 后生效。
+type PromptCacheReplacement struct {
+	Pattern string `yaml:"pattern"`
+	Replace string `yaml:"replace"`
+}
 
 /**
  * Config 是 Codex 代理服务的顶层配置结构
@@ -149,6 +158,23 @@ type Config struct {
 	/* CacheSpoofEnabled 开启缓存写入读取伪造：当上游返回了 cache_read 但未返回 cache_write 时，
 	 * 将首次主请求的 input_tokens 全部改为 cache_write，后续请求维持 cache_read + cache_write 为 input_tokens 的 99% */
 	CacheSpoofEnabled bool `yaml:"cache-spoof-enabled"`
+	/* PromptCacheOptimizeEnabled 开启请求侧提示词缓存优化。仅处理 instructions 与首段可安全提升的 developer 纯文本消息。 */
+	PromptCacheOptimizeEnabled bool `yaml:"prompt-cache-optimize-enabled"`
+	/* PromptCacheTag 是注入 instructions 前缀的稳定缓存标签；空串不注入。 */
+	PromptCacheTag string `yaml:"prompt-cache-tag"`
+	/* PromptCacheNormalizeWhitespace 对稳定区统一换行、行尾空白和连续空行；关闭时仅统一 CRLF/CR。 */
+	PromptCacheNormalizeWhitespace bool `yaml:"prompt-cache-normalize-whitespace"`
+	/* PromptCacheMergeRepeatedBlocks 合并 instructions 中完全相同且至少 256 字节的文本块。 */
+	PromptCacheMergeRepeatedBlocks bool `yaml:"prompt-cache-merge-repeated-blocks"`
+	/* PromptCacheReplacements 用显式正则替换 instructions/前置 developer 提示词中的易变片段。 */
+	PromptCacheReplacements []PromptCacheReplacement `yaml:"prompt-cache-replacements"`
+
+	/* CodexFingerprintMode 指纹收敛模式：off/device/session/full（默认 off，空串按 off 处理）。
+	 * off：透传客户端原样标识；device：仅收敛 installation_id；session/full：全 API 路径共享同一 session_id/thread_id；
+	 * full 保留为兼容模式。仅当 mode 非 off 且 CodexFingerprintSeed 非空时生效。 */
+	CodexFingerprintMode string `yaml:"codex-fingerprint-mode"`
+	/* CodexFingerprintSeed 指纹收敛账号级种子（UUIDv4），所有账号共享，用于确定性派生收敛 ID */
+	CodexFingerprintSeed string `yaml:"codex-fingerprint-seed"`
 
 	/* Enable429ConcurrentRetry 显式开启：遇到 429 时并发用多个账号同时重试，首个成功响应返回客户端 */
 	Enable429ConcurrentRetry bool `yaml:"enable-429-concurrent-retry"`
@@ -571,6 +597,48 @@ func (c *Config) Sanitize() {
 func (c *Config) Validate() error {
 	if err := validateProxyURL(c.ProxyURL); err != nil {
 		return fmt.Errorf("proxy-url 配置无效: %w", err)
+	}
+	if err := validateCodexFingerprint(c.CodexFingerprintMode, c.CodexFingerprintSeed); err != nil {
+		return err
+	}
+	if err := validatePromptCache(c.PromptCacheTag, c.PromptCacheReplacements); err != nil {
+		return err
+	}
+	return nil
+}
+
+/* validateCodexFingerprint 校验指纹收敛配置：mode 只能是 off/device/session/full（空视为 off）；
+ * mode 非 off 时必须提供非空 seed（UUIDv4 格式由使用方 parse 校验） */
+func validateCodexFingerprint(mode, seed string) error {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m == "" || m == "off" {
+		return nil
+	}
+	if m != "device" && m != "session" && m != "full" {
+		return fmt.Errorf("codex-fingerprint-mode 无效 %q，仅支持 off/device/session/full", mode)
+	}
+	if seed == "" {
+		return fmt.Errorf("codex-fingerprint-modes 非 off（%s）时必须配置 codex-fingerprint-seed", m)
+	}
+	if _, err := uuid.Parse(strings.TrimSpace(seed)); err != nil {
+		return fmt.Errorf("codex-fingerprint-seed 无效（需为标准 UUIDv4 格式）: %w", err)
+	}
+	return nil
+}
+
+// validatePromptCache 校验缓存标签与显式替换规则，避免服务运行后才因错误正则失去稳定化能力。
+func validatePromptCache(tag string, replacements []PromptCacheReplacement) error {
+	if strings.ContainsAny(tag, "\r\n") {
+		return fmt.Errorf("prompt-cache-tag 不能包含换行符")
+	}
+	for i, rule := range replacements {
+		pattern := strings.TrimSpace(rule.Pattern)
+		if pattern == "" {
+			return fmt.Errorf("prompt-cache-replacements[%d].pattern 不能为空", i)
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("prompt-cache-replacements[%d].pattern 无效: %w", i, err)
+		}
 	}
 	return nil
 }

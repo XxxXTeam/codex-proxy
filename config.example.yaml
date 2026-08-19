@@ -238,7 +238,31 @@ enable-http2: false
 
 # 缓存写入读取伪造：上游返回了 cache_read 但没有 cache_write 时，
 # 首次主请求将 input_tokens 全部改为 cache_write，后续请求维持 cache_read + cache_write 为 input_tokens 的 99%
+# 仅改写返回用量，不会改善上游真实提示词缓存命中率。
 # cache-spoof-enabled: false
+
+# 请求侧提示词缓存优化（默认关闭；与 cache-spoof-enabled 独立）：
+# - 仅处理 instructions 与首次请求开头、纯文本的 developer message；含 previous_response_id 的连续对话不会移动 message。
+# - 启用后，前置 developer message 会稳定提升至 instructions；可选注入固定标签、统一格式和合并完全相同的大文本块。
+# - replacements 只作用于上述稳定区。请先从实际请求中确认易变片段，再用正则替换为固定文本；错误规则会阻止服务启动。
+# - 不会改写 user、assistant、tool、图片、文件或结构化 developer content。
+# prompt-cache-optimize-enabled: true
+# prompt-cache-tag: "v1"
+# prompt-cache-normalize-whitespace: true
+# prompt-cache-merge-repeated-blocks: true
+# prompt-cache-replacements:
+#   # - pattern: '从已捕获请求确认的易变片段正则'
+#   #   replace: '<stable-region>'
+
+# 指纹收敛（通过全路径共享的稳定设备/会话指纹降低多账号 context 串用，默认关闭）：
+#   off    — 透传客户端原样标识（默认；安全起见保持关闭）
+#   device — 仅收敛 installation_id（账号级种子派生，所有账号共享同一安装 ID）
+#   session— device + 全 API 路径共享同一 session_id/thread_id（推荐；每请求 turn_id 仍唯一）
+#   full   — session 的兼容别名，使用相同的全局共享 session/thread 范围
+# 配置 seed 时必须为标准 UUIDv4（可执行 `uuidgen` 或 `cat /proc/sys/kernel/random/uuid` 生成）。
+# 仅在 mode 非 off 且 seed 非空时生效；不同 mode/seed 组合会改变出站指纹，不影响客户端签名。
+# codex-fingerprint-mode: off
+# codex-fingerprint-seed: "00000000-0000-4000-8000-000000000000"
 
 # 管理类 HTTP / WebSocket 接口（若配置了 api-keys 则需带相同 Key；详见 docs/API-ADMIN.md）:
 #   POST /recover-auth           — 401 恢复：同步刷新 token；刷新 429 时查额度；仍失败则凭据重命名为 *.json.disabled

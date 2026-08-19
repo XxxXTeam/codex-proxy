@@ -91,7 +91,7 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool, 
 		if !gjson.GetBytes(result, "instructions").Exists() {
 			result, _ = sjson.SetBytes(result, "instructions", "")
 		}
-		result, _ = sjson.DeleteBytes(result, "previous_response_id")
+		/* previous_response_id 保留：会话粘性 + 连续对话上下文缓存依赖该字段（failover 时由选号层维护） */
 		result, _ = sjson.DeleteBytes(result, "stream_options")
 		result, _ = sjson.DeleteBytes(result, "prompt_cache_retention")
 		result, _ = sjson.DeleteBytes(result, "safety_identifier")

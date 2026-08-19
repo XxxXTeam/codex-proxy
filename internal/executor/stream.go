@@ -15,7 +15,6 @@ import (
 	"codex-proxy/internal/translator"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -42,10 +41,20 @@ type CodexResponsesStream struct {
 	debugUpstreamStream bool
 	/* cacheSpoofEnabled 缓存写入读取伪造：上游返回 cache_read 但无 cache_write 时按规则伪造 */
 	cacheSpoofEnabled bool
+	/* responseHeader 最近一次上游响应头快照（供 turn-state 等回传头读取；reopen 后随 account 一并更新） */
+	responseHeader http.Header
 }
 
 /* Body 返回当前上游响应体，供外部 pump 读取 SSE */
 func (s *CodexResponsesStream) Body() io.ReadCloser { return s.body }
+
+/* ResponseHeaderValue 返回当前上游响应头中指定键的第一个值（用于 turn-state 等回传头） */
+func (s *CodexResponsesStream) ResponseHeaderValue(key string) string {
+	if s == nil || s.responseHeader == nil {
+		return ""
+	}
+	return s.responseHeader.Get(key)
+}
 
 /* Account 返回当前关联的账号 */
 func (s *CodexResponsesStream) Account() *auth.Account { return s.account }
@@ -55,12 +64,13 @@ func (s *CodexResponsesStream) CacheSpoofEnabled() bool { return s.cacheSpoofEna
 
 // CodexResponsesMeta bundles metadata returned by openCodexResponsesBody.
 type CodexResponsesMeta struct {
-	Account      *auth.Account
-	Attempts     int
-	BaseModel    string
-	ConvertDur   time.Duration
-	SendDur      time.Duration
-	ReverseTools map[string]string
+	Account        *auth.Account
+	Attempts       int
+	BaseModel      string
+	ConvertDur     time.Duration
+	SendDur        time.Duration
+	ReverseTools   map[string]string
+	ResponseHeader http.Header /* 最近一次上游响应头快照（turn-state 等回传头来源） */
 }
 
 /* prefixThenRestCloser 首读已拉取的字节 + 剩余 Body，供在返回给客户端前探测 GOAWAY 后仍能透传已读数据 */
@@ -137,12 +147,21 @@ func codexStreamPumpRounds(maxRetry int) int {
 
 // openCodexResponsesBody 与 OpenCodexResponsesStream 相同：选号、sendWithRetry、首读探测空体/可重试读错并换号。
 // Claude 原始流等非 Pump 路径也经此打开，避免 200 + 空 body 导致客户端 SSE 体完全无字节。
-func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (bodyRC io.ReadCloser, meta CodexResponsesMeta, err error) {
+// fps 为本请求的指纹与粘性状态（可为 nil）。
+func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) (bodyRC io.ReadCloser, meta CodexResponsesMeta, err error) {
 	convertStart := time.Now()
 	thBody, bm, isImage := thinking.ApplyThinking(requestBody, model)
 	meta.BaseModel = bm
-	codexBody := translator.ConvertOpenAIRequestToCodex(meta.BaseModel, thBody, true, isImage)
-	meta.ConvertDur = time.Since(convertStart)
+
+	converted := translator.ConvertOpenAIRequestToCodex(meta.BaseModel, thBody, true, isImage)
+	optimizeStart := time.Now()
+	if fps != nil {
+		/* 出站缓存优化：仅对「上游可见」的确定性字段做静态优化（重试轮间一致），会话级收敛与粘性不在此处改写 */
+		converted = fps.OptimizeCacheForCodex(converted, meta.BaseModel)
+	}
+	codexBody := converted
+	/* ConvertDur 统计转换 + 缓存优化总耗时（两者上游均不可见，仅本逻辑耗时） */
+	meta.ConvertDur = time.Since(optimizeStart) + time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 	sendStart := time.Now()
 
@@ -161,7 +180,7 @@ func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, r
 			return nil, meta, ctx.Err()
 		}
 		rcExcl := MergeRetryConfigExcluded(rc, excluded)
-		httpResp, acc, att, serr := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
+		httpResp, acc, att, serr := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true, fps)
 		if serr != nil {
 			meta.SendDur = time.Since(sendStart)
 			return nil, meta, serr
@@ -236,41 +255,23 @@ func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, r
 		meta.Account = acc
 		meta.Attempts = att
 		meta.ReverseTools = translator.BuildReverseToolNameMap(requestBody)
+		meta.ResponseHeader = httpResp.Header.Clone()
 		return bodyOut, meta, nil
 	}
 	meta.SendDur = time.Since(sendStart)
 	return nil, meta, fmt.Errorf("读取上游流失败")
 }
 
-// OpenCodexResponsesStream 完成选号、重试与首包前的 HTTP 往返；调用方在写入客户端 SSE 头后再 Pump。
-// 在返回前做一次首读：若立即遇 GOAWAY 等可重试错误则关连接换号重来，减少「已 200 后 pump 才断」的失败率。
-func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*CodexResponsesStream, error) {
-	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
-	if err != nil {
-		return nil, err
-	}
-	includeUsage := gjson.GetBytes(requestBody, "stream_options.include_usage").Bool()
-	s := &CodexResponsesStream{
-		body:                bodyRC,
-		account:             meta.Account,
-		Attempts:            meta.Attempts,
-		BaseModel:           meta.BaseModel,
-		ConvertDur:          meta.ConvertDur,
-		SendDur:             meta.SendDur,
-		reverseTools:        meta.ReverseTools,
-		IncludeUsage:        includeUsage,
-		pumpRounds:          codexStreamPumpRounds(rc.MaxRetry),
-		reopenExcluded:      make(map[string]bool),
-		debugUpstreamStream: rc.DebugUpstreamStream,
-			cacheSpoofEnabled:   rc.CacheSpoofEnabled,
-	}
-	s.reopenFn = func(ctx context.Context) (io.ReadCloser, CodexResponsesMeta, error) {
-		rcEx := MergeRetryConfigExcluded(rc, s.reopenExcluded)
-		return e.openCodexResponsesBody(ctx, rcEx, requestBody, model)
-	}
-	return s, nil
+// openCodexResponsesBodyExcl 与 openCodexResponsesBody 相同，但区分为 reopen/pump 换号语义：
+// rc 已由调用方 MergeRetryConfigExcluded 注入排除集合，s.account 在 reopenFn 内先行 RecordFailure 并加入 excluded。
+func (e *Executor) openCodexResponsesBodyExcl(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint, excluded map[string]bool) (bodyRC io.ReadCloser, meta CodexResponsesMeta, err error) {
+	// excluded 已并入 rc（MergeRetryConfigExcluded），此处无需再做账号级过滤
+	_ = excluded
+	return e.openCodexResponsesBody(ctx, rc, requestBody, model, fps)
 }
 
+// OpenCodexResponsesStream 完成选号、重试与首包前的 HTTP 往返；调用方在写入客户端 SSE 头后再 Pump。
+// 在返回前做一次首读：若立即遇 GOAWAY 等可重试错误则关连接换号重来，减少「已 200 后 pump 才断」的失败率。
 // UpstreamBody 返回当前上游响应体，由调用方在读完后 Close（与 PumpChatCompletion 的 defer 语义一致）。
 func (s *CodexResponsesStream) UpstreamBody() io.ReadCloser {
 	if s == nil {
@@ -519,7 +520,7 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 // 若尚未向 w 写入任何字节（已发的 HTTP 响应头不计入），遇读错误、io.EOF 且无字节等均换号重连，次数与 pumpRounds 对齐；除 context.Canceled 外不因「非 GOAWAY」拒绝换号。
 func (s *CodexResponsesStream) PumpRawSSE(w io.Writer, flush func()) error {
 	defer func() { _ = s.body.Close() }()
-	buf := make([]byte, httpBufferSize)
+	buf := make([]byte, HTTPBufferSize)
 	streamStart := time.Now()
 	// 仅统计经 w 写入的 SSE 响应体字节；与 fasthttp SetBodyStreamWriter 一致，状态行/响应头不在此 Writer 上。
 	sseBodyBytes := 0
@@ -630,7 +631,7 @@ func CodexStreamOpenBridgeMax(maxRetry int) int {
 	}
 	return n
 }
-func (e *Executor) RunCodexStreamWithOpenBridges(octx context.Context, rc RetryConfig, requestBody []byte, model string, w io.Writer, flush func(), bridges int, pump CodexStreamPump) error {
+func (e *Executor) RunCodexStreamWithOpenBridges(octx context.Context, rc RetryConfig, requestBody []byte, model string, w io.Writer, flush func(), bridges int, pump CodexStreamPump, fps *RequestsFingerprint) error {
 	var written int64
 	cw := &countingWriter{w: w, n: &written}
 	var lastErr error
@@ -639,7 +640,7 @@ func (e *Executor) RunCodexStreamWithOpenBridges(octx context.Context, rc RetryC
 		if b > 0 {
 			ctx = context.Background()
 		}
-		s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model)
+		s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model, fps)
 		if err != nil {
 			lastErr = err
 			if written == 0 && b < bridges-1 && IsRetryableOpenCodexError(err) {
@@ -677,7 +678,7 @@ type CodexCompactStream struct {
 // PumpBody 透传 compact 响应体；成功读完时由调用方 RecordSuccess。
 func (s *CodexCompactStream) PumpBody(w io.Writer, flush func()) error {
 	defer func() { _ = s.Resp.Body.Close() }()
-	buf := make([]byte, httpBufferSize)
+	buf := make([]byte, HTTPBufferSize)
 	for {
 		n, err := s.Resp.Body.Read(buf)
 		if n > 0 {

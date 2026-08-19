@@ -135,15 +135,23 @@ func (h *ProxyHandler) handleMessages(ctx *fasthttp.RequestCtx) {
 	log.Debugf("收到 Claude Messages 请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
+	/* Claude 与其它 API 共用同一指纹收敛上下文；全局 session/thread 由配置种子派生。 */
+	fps := h.newFingerPrintForRequest(ctx, openaiBody, "")
+	bodyWithFP := openaiBody
+	if fps != nil {
+		if b, _ := fps.ApplyClientMetadata(openaiBody); b != nil {
+			bodyWithFP = b
+		}
+	}
 
 	if stream {
-		if execErr := h.executeClaudeStream(ctx, rc, openaiBody, model); execErr != nil {
+		if execErr := h.executeClaudeStream(ctx, rc, bodyWithFP, model, fps); execErr != nil {
 			handleClaudeExecutorError(ctx, execErr)
 		} else {
 			RecordRequest()
 		}
 	} else {
-		if execErr := h.executeClaudeNonStream(ctx, rc, openaiBody, model); execErr != nil {
+		if execErr := h.executeClaudeNonStream(ctx, rc, bodyWithFP, model, fps); execErr != nil {
 			handleClaudeExecutorError(ctx, execErr)
 		} else {
 			RecordRequest()
@@ -203,7 +211,7 @@ func (h *ProxyHandler) handleMessageCountTokens(ctx *fasthttp.RequestCtx) {
  * @param model - 模型名称
  * @returns error - 执行失败时返回错误
  */
-func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor.RetryConfig, openaiBody []byte, model string) error {
+func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor.RetryConfig, openaiBody []byte, model string, fps *executor.RequestsFingerprint) error {
 	/* 只有到这里才开始写 SSE 头；Open+Pump 在 StreamWriter 内完成，响应体尚无字节时可内部换号与全量重连 */
 	ctx.Response.Header.Set("Content-Type", "text/event-stream")
 	ctx.Response.Header.Set("Cache-Control", "no-cache")
@@ -216,7 +224,7 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 		bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
 		execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, openaiBody, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
 			return pumpClaudeCodexSSE(s, w2, fl, model, h.debugUpstreamStream)
-		})
+		}, fps)
 		if execErr != nil {
 			log.Errorf("Claude stream: %v", execErr)
 			msg := execErr.Error()
@@ -245,8 +253,8 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
  * @param model - 模型名称
  * @returns error - 执行失败时返回错误
  */
-func (h *ProxyHandler) executeClaudeNonStream(ctx *fasthttp.RequestCtx, rc executor.RetryConfig, openaiBody []byte, model string) error {
-	rawResp, account, err := h.executor.ExecuteRawCodexStream(ctx, rc, openaiBody, model)
+func (h *ProxyHandler) executeClaudeNonStream(ctx *fasthttp.RequestCtx, rc executor.RetryConfig, openaiBody []byte, model string, fps *executor.RequestsFingerprint) error {
+	rawResp, account, err := h.executor.ExecuteRawCodexStream(ctx, rc, openaiBody, model, fps)
 	if err != nil {
 		return err
 	}

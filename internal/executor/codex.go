@@ -41,7 +41,8 @@ var (
 
 /* 与 handler 一致的缓冲与扫描器大小，便于统一调优 */
 const (
-	httpBufferSize              = 32 * 1024
+	/* HTTPBufferSize 与 handler 层共享的读缓冲大小 */
+	HTTPBufferSize              = 32 * 1024
 	scannerInitSize             = 4 * 1024
 	scannerMaxSize              = 50 * 1024 * 1024
 	defaultKeepaliveIntervalSec = 60
@@ -77,6 +78,8 @@ type Executor struct {
 	keepAliveOnce        sync.Once
 	resolveAddr          string
 	keepaliveIntervalSec int
+	/* helper 出站粘性选号：由 NewExecutor 注入（供 handler 侧登录复用的同一账号池）；nil 时粘性选号回落普通选号 */
+	manager *auth.Manager
 }
 
 /**
@@ -131,8 +134,8 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		IdleConnTimeout:         time.Duration(idleSec) * time.Second,
 		TLSHandshakeTimeout:     tlsHandshake,
 		ResponseHeaderTimeout:   respHeader,
-		WriteBufferSize:         httpBufferSize,
-		ReadBufferSize:          httpBufferSize,
+		WriteBufferSize:         HTTPBufferSize,
+		ReadBufferSize:          HTTPBufferSize,
 		DisableCompression:      true,
 	})
 	if proxyURL != "" {
@@ -159,6 +162,14 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		resolveAddr:          strings.TrimSpace(poolCfg.ResolveAddress),
 		keepaliveIntervalSec: keepaliveSec,
 	}
+}
+
+/* SetHelperManager 注入账号池辅助引用（Phase C 粘性选号在池内查找命中账号）；handler 在构造后用同一 manager 设置 */
+func (e *Executor) SetHelperManager(m *auth.Manager) {
+	if e == nil {
+		return
+	}
+	e.manager = m
 }
 
 /**
@@ -355,7 +366,7 @@ func IsRetryableStatus(code int) bool {
  * @returns *auth.Account - 使用的账号
  * @returns error - 所有重试均失败时返回错误
  */
-func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model string, apiURL string, codexBody []byte, stream bool) (*http.Response, *auth.Account, int, error) {
+func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model string, apiURL string, codexBody []byte, stream bool, fps *RequestsFingerprint) (*http.Response, *auth.Account, int, error) {
 	maxAttempts := rc.MaxRetry + 1
 	excluded := make(map[string]bool, maxAttempts+8)
 	var lastErr error
@@ -381,7 +392,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			if err != nil {
 				return nil, fmt.Errorf("%w: %w", errCodexBuildRequest, err)
 			}
-			applyCodexHeaders(httpReq, account, stream)
+			applyCodexHeaders(httpReq, account, stream, fpsIDs(fps), fpsGuardEcho(fps, account))
 			buildDur := time.Since(buildStart)
 			dialTarget := effectiveDialTarget(httpReq.URL, e.resolveAddr)
 			log.Debugf("upstream request model=%s stream=%v account=%s attempt=%d/%d method=%s url=%s dial_target=%s", model, stream, account.GetEmail(), attemptOneBased, maxLabel, httpReq.Method, httpReq.URL.String(), dialTarget)
@@ -399,6 +410,12 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
 				log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
 				log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
+				/* 会话粘性选号：本次成功绑定写入粘性表（发送侧成功即视为会话-账号绑定） */
+				if fps != nil && fps.sticky != nil && fps.sticky.Enabled() {
+					if key := fps.sticky.Register(bodyReaderRequestBody(bodyReader, codexBody), account); key != "" {
+						log.Debugf("粘性选号 绑定: key=%s account=%s account_id=%s", key, account.GetEmail(), account.GetAccountID())
+					}
+				}
 				return httpResp, nil
 			}
 
@@ -473,6 +490,21 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 	}
 
 	pickForAttempt := func(attempt int) (*auth.Account, error) {
+		base := rc.PickFn
+		/* 会话粘性选号：命中绑定账号时优先选择命中号（Phase C prefer 模式；命中号不可用时回落普通选号） */
+		if fps != nil && fps.sticky != nil && fps.sticky.Enabled() {
+			if aid := fps.sticky.AccountID(codexBody); aid != "" {
+				if fp := fps.sticky.FilePath(codexBody); fp != "" {
+					excluded[fp] = true
+				}
+				if acc := findAccountForSticky(e, aid); acc != nil {
+					log.Debugf("粘性选号 命中: account_id=%s email=%s", acc.GetAccountID(), acc.GetEmail())
+					excluded[acc.FilePath] = true
+					return acc, nil
+				}
+				log.Debugf("粘性选号 命中但账号不在池: account_id=%s（回落普通选号）", aid)
+			}
+		}
 		if attempt == maxAttempts-1 && rc.LastAttemptPickFn != nil {
 			acc, err := rc.LastAttemptPickFn(ctx, model, excluded)
 			if err != nil {
@@ -486,12 +518,12 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		if rc.HealthyPickMinAttempt > 0 && attempt >= rc.HealthyPickMinAttempt && rc.HealthyPickFn != nil {
 			account, err := rc.HealthyPickFn(model, excluded)
 			if err != nil {
-				return rc.PickFn(model, excluded)
+				return base(model, excluded)
 			}
 			log.Debugf("选号: 尝试 %d/%d 使用最近成功账号策略 account=%s", attempt+1, maxAttempts, account.GetEmail())
 			return account, nil
 		}
-		return rc.PickFn(model, excluded)
+		return base(model, excluded)
 	}
 
 	const maxQuotaReselects = 256
@@ -556,7 +588,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 	/* 并发重试：遇 429 后并发用多个账号同时尝试，首个成功者胜出 */
 	if last429 && rc.ConcurrentRetry429 && ctx.Err() == nil {
 		log.Infof("429 并发重试启动: model=%s timeout=%v", model, rc.ConcurrentRetry429Timeout)
-		cResp, cAcc, cAccounts, cErr := e.concurrentRetryAfter429(ctx, rc, model, apiURL, codexBody, stream, excluded)
+		cResp, cAcc, cAccounts, cErr := e.concurrentRetryAfter429(ctx, rc, model, apiURL, codexBody, stream, excluded, fps)
 		if cErr == nil && cResp != nil {
 			return cResp, cAcc, maxAttempts + 1, nil
 		}
@@ -612,6 +644,7 @@ func (e *Executor) concurrentRetryAfter429(
 	codexBody []byte,
 	stream bool,
 	excluded map[string]bool,
+	fps *RequestsFingerprint,
 ) (*http.Response, *auth.Account, []*auth.Account, error) {
 	timeout := rc.ConcurrentRetry429Timeout
 	if timeout <= 0 {
@@ -686,7 +719,7 @@ func (e *Executor) concurrentRetryAfter429(
 				winCh <- result{nil, account, err}
 				return
 			}
-			applyCodexHeaders(httpReq, account, stream)
+			applyCodexHeaders(httpReq, account, stream, fpsIDs(fps), fpsGuardEcho(fps, account))
 
 			log.Debugf("429 并发重试 发送: account=%s model=%s", account.GetEmail(), model)
 			httpResp, err := e.httpClient.Do(httpReq)
@@ -697,6 +730,12 @@ func (e *Executor) concurrentRetryAfter429(
 			}
 			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
 				log.Infof("429 并发重试 成功: account=%s status=%d", account.GetEmail(), httpResp.StatusCode)
+				/* 会话粘性选号：并发成功也写入绑定（与 sendWithRetry 成功路径一致） */
+				if fps != nil && fps.sticky != nil && fps.sticky.Enabled() {
+					if key := fps.sticky.Register(body, account); key != "" {
+						log.Debugf("粘性选号 绑定(并发): key=%s account=%s", key, account.GetEmail())
+					}
+				}
 				winCh <- result{httpResp, account, nil}
 				return
 			}
@@ -745,6 +784,231 @@ func accountEmails(accs []*auth.Account) []string {
 	return names
 }
 
+/* execStickyAccountNotFound 粘性命中但账号不在池时的空错误 */
+var execStickyAccountNotFound = errors.New("粘性绑定账号不可用")
+
+/* findAccountForSticky 按账号 ID 在当前池中查找账号（返回可发送的活性账号；池无该号返回 nil） */
+func findAccountForSticky(e *Executor, accountID string) *auth.Account {
+	if e == nil || e.manager == nil || accountID == "" {
+		return nil
+	}
+	for _, acc := range e.manager.GetAccounts() {
+		if acc == nil {
+			continue
+		}
+		if acc.GetAccountID() != accountID {
+			continue
+		}
+		if acc.IsAvailable() {
+			return acc
+		}
+		return acc
+	}
+	return nil
+}
+
+/* bodyReaderRequestBody 从尝试用 Reader 中读取当前缓冲内容（供粘性绑定计算键；失败回退原始体） */
+func bodyReaderRequestBody(br *bytes.Reader, fallback []byte) []byte {
+	if br == nil {
+		return fallback
+	}
+	n := br.Len()
+	if n < 0 {
+		return fallback
+	}
+	pos, _ := br.Seek(0, io.SeekCurrent)
+	if pos < 0 {
+		return fallback
+	}
+	if pos > 0 {
+		// 指针尚未在头部：仍然回退（发送成功后 Reader 已 EOF，位点无意义）
+		return fallback
+	}
+	buf := make([]byte, n)
+	if _, err := br.Read(buf); err != nil {
+		return fallback
+	}
+	return buf
+}
+
+/**
+ * RequestsFingerprint 单次出站请求的指纹相关状态：
+ * - ids 为按收敛模式解析的一次性出站 ID 集合（nil 表示 off）
+ * - sessionIDs 为本请求可用的会话粘性显式信号链
+ * - turnStateSeed 为本次请求的回合状态溯源键（flowKey + 客户端会话标识），空串不跟踪
+ */
+type RequestsFingerprint struct {
+	ids           *CodexFingerprintIDs
+	sessionIDs    []string
+	turnStateSeed string
+	sticky        *SessionStickyTable
+	promptCache   PromptCacheOptions
+}
+
+/**
+ * NewRequestsFingerprint 构建本次出站请求的指纹与粘性状态
+ * @param mode - 收敛模式（off/device/session/full）
+ * @param seed - 账号指纹种子（由账号 meta 提供，UUIDv4）
+ * @param clientSessionID - 客户端原始会话标识（session-id / session_id）
+ * @param flowKey - 会话粘性指纹键（apiKey + 客户端标识等），用于 turn-state 溯源
+ * @param sessionIDs - 客户端显式提供的会话标识链（优先级由调用方排序）
+ * @param sticky - 会话粘性表（Phase C：绑定账号优先；nil 关闭）
+ */
+func NewRequestsFingerprint(mode CodexFingerprintMode, seed, clientSessionID, flowKey string, sessionIDs []string, sticky *SessionStickyTable) *RequestsFingerprint {
+	out := &RequestsFingerprint{sessionIDs: sessionIDs, sticky: sticky}
+	if mode != CodexFingerprintOff && seed != "" {
+		out.ids = resolveCodexFingerprintIDs(mode, seed, clientSessionID)
+	}
+	if flowKey != "" {
+		out.turnStateSeed = flowKey
+	}
+	return out
+}
+
+/* SessionIDS 返回显式会话标识链（供粘性选号使用） */
+func (r *RequestsFingerprint) SessionIDS() []string {
+	if r == nil {
+		return nil
+	}
+	return r.sessionIDs
+}
+
+/**
+ * ApplyClientMetadata 将收敛 ID 改写请求体的 client_metadata 与 prompt_cache_key。
+ * @param body - 原始请求体（可能为 nil 表示使用纯 JSON 构建）
+ * @param needPrevResp - 是否在改写前判断 previous_response_id 存在
+ * @returns 改写后的请求体与是否发生修改
+ */
+func (r *RequestsFingerprint) ApplyClientMetadata(body []byte) ([]byte, bool) {
+	return applyCodexFingerprintClientMetadataRaw(body, r.ids)
+}
+
+/**
+ * ApplyClientHeaders2 改写请求头（指纹收敛头 + turn-state 守卫）。
+ * @param header - 出站 HTTP 头
+ * @param guardEcho - 出站回合状态守卫（剥离跨账号回带的 turn-state）
+ */
+func (r *RequestsFingerprint) ApplyClientHeaders2(header http.Header, guardEcho func(h http.Header)) {
+	if guardEcho != nil {
+		guardEcho(header)
+	}
+	if r == nil || r.ids == nil {
+		return
+	}
+	applyCodexFingerprintHeaders(header, r.ids)
+}
+
+/**
+ * OpenCodexResponsesStream 打开 /responses 流式上游连接（2xx 后返回，Body 由 Pump* 关闭）
+ * @param fps - 本请求的指纹与粘性状态（可空）
+ */
+func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) (*CodexResponsesStream, error) {
+	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model, fps)
+	if err != nil {
+		return nil, err
+	}
+	excluded := make(map[string]bool)
+	s := &CodexResponsesStream{
+		body:                bodyRC,
+		account:             meta.Account,
+		Attempts:            meta.Attempts,
+		BaseModel:           meta.BaseModel,
+		ConvertDur:          meta.ConvertDur,
+		SendDur:             meta.SendDur,
+		reverseTools:        meta.ReverseTools,
+		IncludeUsage:        gjson.GetBytes(requestBody, "stream_options.include_usage").Bool(),
+		debugUpstreamStream: rc.DebugUpstreamStream,
+		pumpRounds:          codexStreamPumpRounds(rc.MaxRetry),
+		reopenExcluded:      excluded,
+		cacheSpoofEnabled:   rc.CacheSpoofEnabled,
+		responseHeader:      meta.ResponseHeader,
+	}
+
+	/* reopen 换号后同步更新响应头快照（turn-state 守卫需要按最新账号判定） */
+	applyMeta := func(dst *CodexResponsesStream, m CodexResponsesMeta) {
+		if m.Account != nil {
+			dst.account = m.Account
+		}
+		dst.Attempts += m.Attempts
+		if m.ResponseHeader != nil {
+			dst.responseHeader = m.ResponseHeader
+		}
+	}
+	applyMeta(s, meta)
+	s.reopenFn = func(ctx context.Context) (io.ReadCloser, CodexResponsesMeta, error) {
+		rExcl := MergeRetryConfigExcluded(rc, excluded)
+		s.account.RecordFailure()
+		excluded[s.account.FilePath] = true
+		bodyReopen, meta2, err2 := e.openCodexResponsesBodyExcl(ctx, rExcl, requestBody, model, fps, excluded)
+		if err2 == nil {
+			applyMeta(s, meta2)
+		}
+		return bodyReopen, meta2, err2
+	}
+	return s, nil
+}
+
+/**
+ * OpenResponsesStream 打开 /responses 流式上游连接，供 Chat Completions 兼容路径使用
+ */
+func (e *Executor) OpenResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, int, string, time.Duration, time.Duration, error) {
+	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model, nil)
+	if err != nil {
+		return nil, nil, 0, "", 0, 0, err
+	}
+	return &RawResponse{StatusCode: http.StatusOK, Body: bodyRC}, meta.Account, meta.Attempts, meta.BaseModel, meta.ConvertDur, meta.SendDur, nil
+}
+
+/* sessionIDCandidates 请求体中可用于粘性的会话标识候选（保留顺序） */
+var sessionIDCandidates = []string{
+	"client_metadata.session_id",
+	"session_id",
+	"client_metadata.x-codex-window-id",
+	"x-codex-window-id",
+}
+
+/* sessionIDCandidateMap 供 handler 侧读取（避免导出切片别名被误改） */
+var sessionIDCandidateMap = func() []string {
+	out := make([]string, len(sessionIDCandidates))
+	copy(out, sessionIDCandidates)
+	return out
+}()
+
+/* SessionIDCandidatePaths 返回请求体会话标识候选路径（副本，供 handler 侧轮询） */
+func SessionIDCandidatePaths() []string {
+	return sessionIDCandidateMap
+}
+
+/* previousResponseIDFromBody 提取请求体中的 previous_response_id（粘性判定用） */
+func previousResponseIDFromBody(requestBody []byte) string {
+	return strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String())
+}
+
+/* resolveUpstreamSessionID 从按优先级排序的候选键中提取第一个非空值（粘性显式信号） */
+func resolveUpstreamSessionID(requestBody []byte) string {
+	for _, key := range sessionIDCandidates {
+		if v := strings.TrimSpace(gjson.GetBytes(requestBody, key).String()); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+/* compact 与 resp 路径共用：从请求体提取粘性键（先显式信号，后 previous_response_id 兜底） */
+func stickyKeyFromBody(requestBody []byte) string {
+	if requestBody == nil {
+		return ""
+	}
+	if v := resolveUpstreamSessionID(requestBody); v != "" {
+		return v
+	}
+	prev := previousResponseIDFromBody(requestBody)
+	if prev != "" {
+		return prev
+	}
+	return ""
+}
+
 /**
  * ExecuteStream 执行流式请求（内部重试）
  * 将 OpenAI 格式请求转换为 Codex 格式，在内部切换账号重试直到获得 2xx 响应
@@ -758,7 +1022,7 @@ func accountEmails(accs []*auth.Account) []string {
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
-	s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model)
+	s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model, nil)
 	if err != nil {
 		return err
 	}
@@ -786,7 +1050,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
  * @returns []byte - OpenAI Chat Completions 格式的响应 JSON
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
+func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) ([]byte, error) {
 	startTotal := time.Now()
 	convertStart := time.Now()
 	_, baseModel, _ := thinking.ApplyThinking(requestBody, model)
@@ -801,7 +1065,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 	for emptyAttempt := 0; emptyAttempt <= emptyRetryMax; emptyAttempt++ {
 		rcExcl := MergeRetryConfigExcluded(rc, excludedForEmpty)
 		/* 使用流方式打开上游连接，逐行读取 SSE 事件直至 response.completed */
-		s, err := e.OpenCodexResponsesStream(ctx, rcExcl, requestBody, model)
+		s, err := e.OpenCodexResponsesStream(ctx, rcExcl, requestBody, model, fps)
 		if err != nil {
 			return nil, err
 		}
@@ -916,7 +1180,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
-	s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model)
+	s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model, nil)
 	if err != nil {
 		return err
 	}
@@ -944,11 +1208,14 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, r
  * @returns []byte - Codex Responses API 格式的完整响应 JSON
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
+func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) ([]byte, error) {
 	startTotal := time.Now()
 	convertStart := time.Now()
 	body, baseModel, isImage := thinking.ApplyThinking(requestBody, model)
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true, isImage)
+	if fps != nil {
+		codexBody = fps.OptimizeCacheForCodex(codexBody, baseModel)
+	}
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 
@@ -968,7 +1235,7 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 		}
 		rcExcl := MergeRetryConfigExcluded(rc, excluded)
 		/* 始终以 stream=true 发送上游，接收 SSE 后提取 response.completed 事件 */
-		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
+		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true, fps)
 		if err != nil {
 			return nil, err
 		}
@@ -1105,23 +1372,6 @@ func isRawResponseObject(root gjson.Result) bool {
 	return root.Get("id").Exists() && root.Get("output").Exists()
 }
 
-func (e *Executor) OpenResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, int, string, time.Duration, time.Duration, error) {
-	convertStart := time.Now()
-	body, baseModel, isImage := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true, isImage)
-	convertDur := time.Since(convertStart)
-	apiURL := e.baseURL + "/responses"
-
-	sendStart := time.Now()
-	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
-	if err != nil {
-		return nil, nil, 0, "", 0, 0, err
-	}
-	sendDur := time.Since(sendStart)
-
-	return &RawResponse{StatusCode: httpResp.StatusCode, Body: httpResp.Body}, account, attempts, baseModel, convertDur, sendDur, nil
-}
-
 /**
  * ExecuteResponsesCompactStream 执行 Responses Compact API 流式请求（内部重试）
  * 使用 /responses/compact 端点，直接透传 Codex SSE 事件到客户端
@@ -1135,7 +1385,7 @@ func (e *Executor) OpenResponsesStream(ctx context.Context, rc RetryConfig, requ
  */
 func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
 	startTotal := time.Now()
-	compact, err := e.OpenCodexCompactStream(ctx, rc, requestBody, model)
+	compact, err := e.OpenCodexCompactStream(ctx, rc, requestBody, model, nil)
 	if err != nil {
 		return err
 	}
@@ -1170,16 +1420,19 @@ func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryCo
  * @returns []byte - compact 格式的完整响应
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
+func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) ([]byte, error) {
 	startTotal := time.Now()
 	convertStart := time.Now()
 	body, baseModel, _ := thinking.ApplyThinking(requestBody, model)
 	codexBody := cleanCompactBody(body, baseModel)
+	if fps != nil {
+		codexBody = fps.OptimizeCacheForCodex(codexBody, baseModel)
+	}
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses/compact"
 
 	sendStart := time.Now()
-	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true, fps)
 	if err != nil {
 		return nil, err
 	}
@@ -1201,14 +1454,17 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 }
 
 // OpenCodexCompactStream 打开 /responses/compact 流式上游连接（2xx 后返回，Body 由 PumpBody 关闭）。
-func (e *Executor) OpenCodexCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*CodexCompactStream, error) {
+func (e *Executor) OpenCodexCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) (*CodexCompactStream, error) {
 	convertStart := time.Now()
 	body, baseModel, _ := thinking.ApplyThinking(requestBody, model)
 	codexBody := cleanCompactBody(body, baseModel)
+	if fps != nil {
+		codexBody = fps.OptimizeCacheForCodex(codexBody, baseModel)
+	}
 	convertDur := time.Since(convertStart)
 	apiURL := e.baseURL + "/responses/compact"
 	sendStart := time.Now()
-	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true, fps)
 	if err != nil {
 		return nil, err
 	}
@@ -1279,7 +1535,8 @@ func cleanCompactBody(body []byte, baseModel string) []byte {
 	result, _ = sjson.DeleteBytes(result, "parallel_tool_calls")
 	result, _ = sjson.DeleteBytes(result, "reasoning")
 	result, _ = sjson.DeleteBytes(result, "include")
-	result, _ = sjson.DeleteBytes(result, "previous_response_id")
+	/* previous_response_id 保留：会话粘性与连续对话依赖（用于 /responses 全量重连与桥；Compact 路径若上游拒绝可由配置关闭） */
+	result, _ = sjson.DeleteBytes(result, "stream_options")
 	result, _ = sjson.DeleteBytes(result, "prompt_cache_retention")
 	result, _ = sjson.DeleteBytes(result, "safety_identifier")
 	result, _ = sjson.DeleteBytes(result, "generate")
@@ -1327,8 +1584,8 @@ type RawResponse struct {
  * @returns *auth.Account - 使用的账号（调用方用于 RecordSuccess）
  * @returns error - 请求发送失败时返回错误
  */
-func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, error) {
-	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
+func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) (*RawResponse, *auth.Account, error) {
+	bodyRC, meta, err := e.openCodexResponsesBody(ctx, rc, requestBody, model, fps)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1340,14 +1597,22 @@ func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, re
  * @param r - HTTP 请求
  * @param account - 账号（提供 access_token 和 account_id）
  * @param stream - 是否为流式请求
+ * @param ids - 已按收敛模式解析出的出站 ID 集合 nil 表示 off 模式
+ * @param guardEcho - 出站 turn-state 守卫（按账号剥离跨账号回带的 x-codex-turn-state）
  */
-func applyCodexHeaders(r *http.Request, account *auth.Account, stream bool) {
+func applyCodexHeaders(r *http.Request, account *auth.Account, stream bool, ids *CodexFingerprintIDs, guardEcho func(h http.Header)) {
 	token := account.GetAccessToken()
 	codexmeta.ApplyClientHeaders(r.Header, account.GetAccountID())
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+token)
-	r.Header.Set("Session_id", uuid.NewString())
+	r.Header.Set("session_id", uuid.NewString())
 	r.Header.Set("Connection", "Keep-Alive")
+	if guardEcho != nil {
+		guardEcho(r.Header)
+	}
+	if ids != nil {
+		applyCodexFingerprintHeaders(r.Header, ids)
+	}
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")

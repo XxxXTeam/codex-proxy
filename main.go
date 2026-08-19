@@ -307,14 +307,17 @@ func main() {
 		HTTP2MaxConnsPerHostCap:  cfg.HTTP2MaxConnsPerHostCap,
 		ResponseHeaderTimeoutSec: cfg.UpstreamResponseHeaderTimeoutSec,
 	})
+	/* Phase C 会话粘性选号：executor 需要同一账号池在命中绑定号时查号 */
+	exec.SetHelperManager(manager)
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		exec.StartKeepAlive(ctx)
 	}()
 
 	/* 初始化 HTTP 服务 */
+	promptCacheOptions := buildPromptCacheOptions(cfg)
 	r := router.New()
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.QuotaPrecheck, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, cfg.EnableModelSuffixFast, cfg.EnableModelSuffix1M, cfg.EnableModelSuffixImage, cfg.EnableWebSocket, cfg.DebugWSStream, cfg.Enable429ConcurrentRetry, cfg.ConcurrentRetry429TimeoutSec, cfg.CacheSpoofEnabled, static.Assets)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.QuotaCheckCacheTTLSec, quotaChecker, cfg.QuotaPrecheck, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, cfg.EnableModelSuffixFast, cfg.EnableModelSuffix1M, cfg.EnableModelSuffixImage, cfg.EnableWebSocket, cfg.DebugWSStream, cfg.Enable429ConcurrentRetry, cfg.ConcurrentRetry429TimeoutSec, cfg.CacheSpoofEnabled, cfg.CodexFingerprintMode, cfg.CodexFingerprintSeed, promptCacheOptions, static.Assets)
 	proxyHandler.RegisterRoutes(r)
 	handler.SetupLoginRoutes(r, cfg.AuthDir, cfg.OAuthCallbackPort, cfg.OAuthNoBrowser, cfg.EnableCodexLogin, manager)
 
@@ -571,4 +574,25 @@ func loadAllAccountsFromDB(db *sql.DB, dialect codexdb.Dialect) ([]*auth.Account
 	}
 
 	return accounts, nil
+}
+
+// buildPromptCacheOptions 将已通过 config.Validate 的 YAML 配置转换为执行器不可变配置快照。
+func buildPromptCacheOptions(cfg *config.Config) executor.PromptCacheOptions {
+	if cfg == nil {
+		return executor.NewPromptCacheOptions(false, "", false, false, nil)
+	}
+	rules := make([]executor.PromptCacheReplacement, 0, len(cfg.PromptCacheReplacements))
+	for _, rule := range cfg.PromptCacheReplacements {
+		rules = append(rules, executor.PromptCacheReplacement{
+			Pattern: rule.Pattern,
+			Replace: rule.Replace,
+		})
+	}
+	return executor.NewPromptCacheOptions(
+		cfg.PromptCacheOptimizeEnabled,
+		cfg.PromptCacheTag,
+		cfg.PromptCacheNormalizeWhitespace,
+		cfg.PromptCacheMergeRepeatedBlocks,
+		rules,
+	)
 }

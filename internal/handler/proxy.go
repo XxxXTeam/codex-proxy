@@ -36,11 +36,71 @@ import (
 
 /* 与 executor 一致的缓冲与扫描器大小，便于统一调优 */
 const (
-	wsBufferSize     = 32 * 1024
-	scannerInitSize  = 4 * 1024
-	scannerMaxSize   = 50 * 1024 * 1024
-	statsMaxPageSize = 200
+	execHTTPBufferSize = executor.HTTPBufferSize
+	wsBufferSize       = 32 * 1024
+	scannerInitSize    = 4 * 1024
+	scannerMaxSize     = 50 * 1024 * 1024
+	statsMaxPageSize   = 200
 )
+
+/* clientSessionKey 上下文键：从请求头提取的客户端会话标识（供指纹/turn-state 复用） */
+type clientSessionKey struct{}
+
+/* ctxClientSessionID 从 fasthttp 上下文缓存提取客户端会话标识（未设置返回空串） */
+func ctxClientSessionID(ctx *fasthttp.RequestCtx) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.UserValue(clientSessionKey{}).(string); ok {
+		return v
+	}
+	return extractCodexClientSessionID(ctx)
+}
+
+/* resolveFPSeed 解析本次请求适用的指纹种子与模式（handler 层与账号无关的配置侧解析） */
+func (h *ProxyHandler) resolveFPSeed() (executor.CodexFingerprintMode, string) {
+	if h.fingerprintMode == executor.CodexFingerprintOff || h.fingerprintMode == "" {
+		return executor.CodexFingerprintOff, ""
+	}
+	return h.fingerprintMode, h.fingerprintSeed
+}
+
+/* newFingerPrintForRequest 构建本次请求的指纹状态：
+ * 仅当配置启用了 non-off 指纹收敛（codex-fingerprint-mode/-seed）时返回非 nil。
+ * clientSessionID 从请求头 session-id/session_id 提取；flowKey 为空串（turn-state 溯源 seed 由 handler relay 侧构造）。
+ */
+func (h *ProxyHandler) newFingerPrintForRequest(ctx *fasthttp.RequestCtx, body []byte, clientSessionID string) *executor.RequestsFingerprint {
+	mode, seed := h.resolveFPSeed()
+	if clientSessionID == "" {
+		clientSessionID = ctxClientSessionID(ctx)
+	}
+	if (mode == executor.CodexFingerprintOff || mode == "" || seed == "") && !h.promptCache.Enabled {
+		return nil
+	}
+	/* 会话粘性选号：显式会话标识链（依据现有 executor 内部声明保持字段语义） */
+	var sessionIDs []string
+	if body != nil {
+		for _, p := range executor.SessionIDCandidatePaths() {
+			v := strings.TrimSpace(gjson.GetBytes(body, p).String())
+			if v != "" && !containsString(sessionIDs, v) {
+				sessionIDs = append(sessionIDs, v)
+			}
+		}
+	}
+	fps := executor.NewRequestsFingerprint(mode, seed, clientSessionID, "", sessionIDs, h.stickySpill)
+	fps.SetPromptCacheOptions(h.promptCache)
+	return fps
+}
+
+/* containsString 报告切片中是否已包含指定值（去重） */
+func containsString(s []string, v string) bool {
+	for _, it := range s {
+		if it == v {
+			return true
+		}
+	}
+	return false
+}
 
 type statsPagination struct {
 	Page          int    `json:"page"`
@@ -80,16 +140,22 @@ type ProxyHandler struct {
 	quotaPrecheck             bool /* true：选号后 wham 预检；false：直发上游，401 换号+异步 OAuth */
 	staticAssets              fs.FS
 	emptyRetryMax             int
-	debugUpstreamStream       bool          /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
-	enableModelFast           bool          /* 是否允许模型名携带 -fast */
-	enableModel1M             bool          /* 是否允许模型名携带 -1m */
-	enableModelImage          bool          /* 是否允许模型名携带 -image */
-	enableWebSocket           bool          /* 是否允许 /v1/responses 走 WebSocket */
-	debugWSStream             bool          /* WS 转发时是否打印每帧 debug 日志 */
-	concurrentRetry429        bool          /* 遇 429 时并发重试 */
-	concurrentRetry429Timeout time.Duration /* 并发重试最大等待时间 */
-	cacheSpoofEnabled         bool          /* 缓存写入读取伪造：上游返回 cache_read 但无 cache_write 时按规则伪造 */
-	auth401RecoverTracks      sync.Map      /* key: filePath, value: *auth401RecoverTrack */
+	debugUpstreamStream       bool                          /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
+	enableModelFast           bool                          /* 是否允许模型名携带 -fast */
+	enableModel1M             bool                          /* 是否允许模型名携带 -1m */
+	enableModelImage          bool                          /* 是否允许模型名携带 -image */
+	enableWebSocket           bool                          /* 是否允许 /v1/responses 走 WebSocket */
+	debugWSStream             bool                          /* WS 转发时是否打印每帧 debug 日志 */
+	concurrentRetry429        bool                          /* 遇 429 时并发重试 */
+	concurrentRetry429Timeout time.Duration                 /* 并发重试最大等待时间 */
+	cacheSpoofEnabled         bool                          /* 缓存写入读取伪造：上游返回 cache_read 但无 cache_write 时按规则伪造 */
+	fingerprintMode           executor.CodexFingerprintMode /* 指纹收敛模式（off 默认） */
+	fingerprintSeed           string                        /* 指纹收敛账号级种子（codex-fingerprint-seed） */
+	promptCache               executor.PromptCacheOptions   /* 请求提示词缓存优化配置（独立于缓存用量伪造） */
+	fingerprintSeedAPIKey     string                        /* 指纹种子对应的 API key 归属（seed 为空时不参与） */
+	turnStateStore            *executor.TurnStateStore      /* 上游回传 turn-state 溯源表（failover 守卫） */
+	stickySpill               *executor.SessionStickyTable  /* 会话粘性选号表（records 进程内，响应成功/失败时写） */
+	auth401RecoverTracks      sync.Map                      /* key: filePath, value: *auth401RecoverTrack */
 	/* retryCfg 在首请求时构建一次，避免每条对话重复分配闭包与 RetryConfig */
 	retryCfgOnce sync.Once
 	retryCfg     executor.RetryConfig
@@ -112,9 +178,11 @@ type auth401RecoverTrack struct {
  * @param quotaChecker - 与 main 注入 Manager 的同一实例（wham/usage）；nil 时内部新建
  * @param quotaPrecheck - true 时选号后 wham 预检；false 时直发上游（401 换号 + 异步 OAuth，见 quota-precheck 配置）
  * @param debugUpstreamStream - 是否 Info 打印上游 Codex SSE 原文（对应配置 debug-upstream-stream）
+ * @param fingerprintMode - 指纹收敛模式（off/device/session/full；非 off 且 seed 非空时生效）
+ * @param fingerprintSeed - 指纹收敛账号级种子（UUIDv4；由 config 层校验）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableModelImage bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, cacheSpoofEnabled bool, staticAssets fs.FS) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, enableModelImage bool, enableWebSocket bool, debugWSStream bool, concurrentRetry429 bool, concurrentRetry429TimeoutSec int, cacheSpoofEnabled bool, fingerprintMode string, fingerprintSeed string, promptCache executor.PromptCacheOptions, staticAssets fs.FS) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -141,13 +209,23 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		enableWebSocket:     enableWebSocket,
 		debugWSStream:       debugWSStream,
 		concurrentRetry429:  concurrentRetry429,
-		cacheSpoofEnabled:  cacheSpoofEnabled,
+		cacheSpoofEnabled:   cacheSpoofEnabled,
+		promptCache:         promptCache,
 		concurrentRetry429Timeout: func() time.Duration {
 			if concurrentRetry429TimeoutSec > 0 {
 				return time.Duration(concurrentRetry429TimeoutSec) * time.Second
 			}
 			return 30 * time.Second
 		}(),
+	}
+
+	/* 指纹收敛模式：非 off 且 seed 非空时启用（mode 由 config 层校验，此处兜底对大小写归一） */
+	h.fingerprintMode = executor.CodexFingerprintMode(strings.ToLower(strings.TrimSpace(fingerprintMode)))
+	h.fingerprintSeed = strings.TrimSpace(fingerprintSeed)
+
+	/* 上游回传 turn-state 溯源表（failover 守卫使用）；仅在启用指纹收敛时持有，避免无意义内存开销 */
+	if h.fingerprintMode != executor.CodexFingerprintOff && h.fingerprintMode != "" && h.fingerprintSeed != "" {
+		h.turnStateStore = executor.NewTurnStateStore(0)
 	}
 
 	/* 设置全局缓存伪造开关 */
@@ -178,6 +256,8 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 	if len(h.apiKeys) > 0 {
 		apiResponses = h.authMiddleware(h.handleResponses)
 	}
+	/* 会话粘性选号：记录上一 responses 上游绑定，user-session 键由请求头 user-key 提供（可选） */
+	h.stickySpill = executor.NewSessionStickyTable()
 	r.POST("/v1/responses", apiResponses)
 	r.GET("/v1/responses", apiResponses)
 
@@ -812,6 +892,13 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 	log.Debugf("收到请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
+	fps := h.newFingerPrintForRequest(ctx, body, "")
+	chatBody := body
+	if fps != nil {
+		if b, _ := fps.ApplyClientMetadata(body); b != nil {
+			chatBody = b
+		}
+	}
 
 	if stream {
 		/* 头与状态在 StreamWriter 外发送；Open+Pump 在 Writer 内完成，上游断连等在响应体尚无字节时可内部多轮全量重连，最后再向客户端写 SSE 错误 */
@@ -826,9 +913,9 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 			flush := func() { _ = w.Flush() }
 			sw := newStreamBufWriter(w)
 			bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
-			execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, body, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
+			execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, chatBody, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
 				return s.PumpChatCompletion(w2, fl)
-			})
+			}, fps)
 			if execErr != nil {
 				log.Errorf("chat stream: %v", execErr)
 				msg, typ := chatStreamPumpErrorMeta(execErr)
@@ -840,7 +927,7 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	result, execErr := h.executor.ExecuteNonStream(ctx, rc, body, model)
+	result, execErr := h.executor.ExecuteNonStream(ctx, rc, chatBody, model, fps)
 	if execErr != nil {
 		handleExecutorError(ctx, execErr)
 		return
@@ -1217,6 +1304,13 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 	log.Debugf("收到 Responses 请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
+	fps := h.newFingerPrintForRequest(ctx, body, "")
+	bodyWithFP := body
+	if fps != nil {
+		if b, _ := fps.ApplyClientMetadata(body); b != nil {
+			bodyWithFP = b
+		}
+	}
 
 	if stream {
 		/* 头与状态在 StreamWriter 外发送；Open+Pump 在 Writer 内完成，connection closed 等在体尚无字节时可内部多轮全量重连 */
@@ -1231,9 +1325,9 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 			flush := func() { _ = w.Flush() }
 			sw := newStreamBufWriter(w)
 			bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
-			execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, body, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
-				return s.PumpRawSSE(w2, fl)
-			})
+			execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, bodyWithFP, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
+				return h.pumpResponsesSSERelayTurnState(w2, fl, s, ctx)
+			}, fps)
 			if execErr != nil {
 				log.Errorf("responses stream: %v", execErr)
 				msg, typ := chatStreamPumpErrorMeta(execErr)
@@ -1245,7 +1339,7 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	result, execErr := h.executor.ExecuteResponsesNonStream(ctx, rc, body, model)
+	result, execErr := h.executor.ExecuteResponsesNonStream(ctx, rc, bodyWithFP, model, fps)
 	if execErr != nil {
 		handleExecutorError(ctx, execErr)
 		return
@@ -1324,6 +1418,7 @@ func (s *wsSession) close() {
 
 func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 	log.Debugf("responses ws: 升级请求 remote=%s", ctx.RemoteAddr())
+	clientSessionID := extractCodexClientSessionID(ctx)
 	err := responsesWSUpgrader.Upgrade(ctx, func(conn *websocket.Conn) {
 		sess := newWSSession(conn)
 		defer func() {
@@ -1387,7 +1482,7 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 
 				log.Debugf("responses ws: event=%s model=%s", eventType, model)
 				rc := h.buildRetryConfig()
-				streamErr := h.forwardResponsesSSEAsWSSession(ctx, sess, rc, requestBody, model)
+				streamErr := h.forwardResponsesSSEAsWSSession(ctx, sess, rc, requestBody, model, clientSessionID)
 				if streamErr == nil {
 					sess.lastModel = model
 					RecordRequest()
@@ -1415,14 +1510,21 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 	}
 }
 
-func (h *ProxyHandler) forwardResponsesSSEAsWSSession(ctx context.Context, sess *wsSession, rc executor.RetryConfig, requestBody []byte, model string) error {
+func (h *ProxyHandler) forwardResponsesSSEAsWSSession(ctx context.Context, sess *wsSession, rc executor.RetryConfig, requestBody []byte, model, clientSessionID string) error {
 	bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
+	fps := h.newFingerPrintForRequest(nil, requestBody, clientSessionID)
+	wsBody := requestBody
+	if fps != nil {
+		if b, _ := fps.ApplyClientMetadata(requestBody); b != nil {
+			wsBody = b
+		}
+	}
 	/* wsNopWriter 仅负责计数，实际 WS 写入在 pump 内完成 */
-	return h.executor.RunCodexStreamWithOpenBridges(ctx, rc, requestBody, model,
+	return h.executor.RunCodexStreamWithOpenBridges(ctx, rc, wsBody, model,
 		&wsNopWriter{}, func() {}, bridges,
 		func(s *executor.CodexResponsesStream, w io.Writer, flush func()) error {
-			return h.pumpSSEToWSSession(s, sess, w, ctx)
-		})
+			return h.pumpSSEToWSSession(s, sess, w, ctx, clientSessionID)
+		}, fps)
 }
 
 /* wsNopWriter 仅用于 RunCodexStreamWithOpenBridges 的 countingWriter 计数，实际写入走 sess.writeMessage */
@@ -1430,10 +1532,11 @@ type wsNopWriter struct{}
 
 func (w *wsNopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-func (h *ProxyHandler) pumpSSEToWSSession(s *executor.CodexResponsesStream, sess *wsSession, countW io.Writer, ctx context.Context) error {
+func (h *ProxyHandler) pumpSSEToWSSession(s *executor.CodexResponsesStream, sess *wsSession, countW io.Writer, ctx context.Context, clientSessionID string) error {
 	hasContent := false
 	flushed := false
 	var buffer [][]byte
+	relayedTurnState := false
 
 	scanner := bufio.NewScanner(s.Body())
 	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
@@ -1446,6 +1549,16 @@ func (h *ProxyHandler) pumpSSEToWSSession(s *executor.CodexResponsesStream, sess
 		payload := bytes.TrimSpace(line[5:])
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 			continue
+		}
+
+		if !relayedTurnState {
+			if ts := s.ResponseHeaderValue(executor.CodexTurnStateHeader); ts != "" {
+				if turned := h.relayTurnState(ts, s.Account(), clientSessionID); turned != ts {
+					relayedTurnState = true
+					_ = sess.writeMessage(websocket.TextMessage, []byte(wrappedSSEFromData(turned)))
+					_, _ = countW.Write([]byte(turned))
+				}
+			}
 		}
 
 		if h.debugWSStream {
@@ -1517,6 +1630,97 @@ func (h *ProxyHandler) pumpSSEToWSSession(s *executor.CodexResponsesStream, sess
 	return nil
 }
 
+func (h *ProxyHandler) pokeClientKeepAlive(ctx *fasthttp.RequestCtx) {
+	_ = ctx
+}
+
+// pumpResponsesSSERelayTurnState 透传上游 SSE，同时处理 x-codex-turn-state 回传头：
+// 首次遇到 turn-state 头时改为 `event: turn_state\ndata: <value>\n\n` 行转发给客户端
+// （保持 SSE 事件流格式；客户端据此回带同一 turn state）。随后客户端回带的
+// x-codex-turn-state 请求头会由出站守卫（guardEchoFn/fpsGuardEcho）按账号归属放行或剥离。
+// ctx 仅用于在需要时提取客户端会话标识，当前为 nil 安全。
+func (h *ProxyHandler) pumpResponsesSSERelayTurnState(w io.Writer, flush func(), s *executor.CodexResponsesStream, ctx *fasthttp.RequestCtx) error {
+	_ = ctx
+	relayed := false
+	relay := func(payload string) error {
+		if _, err := io.WriteString(w, "event: turn_state\ndata: "); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, payload); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, "\n\n"); err != nil {
+			return err
+		}
+		if flush != nil {
+			flush()
+		}
+		return nil
+	}
+	buf := make([]byte, executor.HTTPBufferSize)
+	for {
+		n, readErr := s.Body().Read(buf)
+		if n > 0 {
+			if !relayed {
+				if ts := s.ResponseHeaderValue(executor.CodexTurnStateHeader); ts != "" {
+					turned := h.relayTurnState(ts, s.Account(), "")
+					if err := relay(turned); err != nil {
+						return err
+					}
+					relayed = true
+				}
+			}
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			if flush != nil {
+				flush()
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+// relayTurnState 记录 turn state 溯源关系并改写回传值（向客户端发布前）：
+// seed = "\x00" + clientSessionID（apiKeyID 前置部分由出站侧流键补充；handler 仅用客户端会话标识区分）。
+// 首个拿到该 turn state 的上游账号被 store 记录为归属；后续 failover 换号时，出站守卫
+// 发现 seed/accountID 与当前账号不一致即剥离回带，避免跨账号串用 turn 上下文。
+func (h *ProxyHandler) relayTurnState(raw string, account *auth.Account, clientSessionID string) string {
+	if raw == "" || account == nil {
+		return raw
+	}
+	aid := account.GetAccountID()
+	if aid == "" {
+		return raw
+	}
+	seed := executor.RelationshipSeed("", clientSessionID)
+	if h.turnStateStore != nil {
+		h.turnStateStore.Store(seed, aid, clientSessionID)
+	}
+	return executor.RewriteTurnStateForClient(raw, seed, aid, clientSessionID)
+}
+
+// extractCodexClientSessionID 从 fasthttp 请求头中提取客户端会话标识。
+func extractCodexClientSessionID(ctx *fasthttp.RequestCtx) string {
+	if v := strings.TrimSpace(string(ctx.Request.Header.Peek("session-id"))); v != "" {
+		return v
+	}
+	return strings.TrimSpace(string(ctx.Request.Header.Peek("session_id")))
+}
+
+// wrappedSSEFromData 将事件数据包装为 SSE 事件行（供 WS 路径复用）。
+func wrappedSSEFromData(payload string) string {
+	if payload == "" {
+		return ""
+	}
+	return "data:" + payload + "\n"
+}
+
 func (h *ProxyHandler) writeWSError(conn *websocket.Conn, errType, message string) {
 	errBody := `{"type":"error","error":{"type":"","message":""}}`
 	errBody, _ = sjson.Set(errBody, "error.type", errType)
@@ -1557,9 +1761,16 @@ func (h *ProxyHandler) handleResponsesCompact(ctx *fasthttp.RequestCtx) {
 	log.Debugf("收到 Responses Compact 请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
+	fps := h.newFingerPrintForRequest(ctx, body, "")
+	compactBody := body
+	if fps != nil {
+		if b, _ := fps.ApplyClientMetadata(body); b != nil {
+			compactBody = b
+		}
+	}
 
 	if stream {
-		compact, openErr := h.executor.OpenCodexCompactStream(ctx, rc, body, model)
+		compact, openErr := h.executor.OpenCodexCompactStream(ctx, rc, compactBody, model, fps)
 		if openErr != nil {
 			handleExecutorError(ctx, openErr)
 			return
@@ -1582,7 +1793,7 @@ func (h *ProxyHandler) handleResponsesCompact(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	result, execErr := h.executor.ExecuteResponsesCompactNonStream(ctx, rc, body, model)
+	result, execErr := h.executor.ExecuteResponsesCompactNonStream(ctx, rc, compactBody, model, fps)
 	if execErr != nil {
 		handleExecutorError(ctx, execErr)
 		return

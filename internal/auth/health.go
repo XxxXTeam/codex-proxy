@@ -228,6 +228,10 @@ func (hc *HealthChecker) checkAccount(ctx context.Context, manager *Manager, acc
 		return
 	}
 
+	/* 健康检查探针不做全局指纹收敛：它与用户会话掺合会污染收敛后的缓存前缀，且探针触发量与请求量完全无关，
+	 * 全局共享的稳定前缀一旦被探针命中，所有用户账号的缓存上下文都会落入同一前缀而互相覆盖。
+	 * 收敛范围仅界定为用户 API 全路径（Chat/Responses/WS/Compact/Claude），本探针明确排除。 */
+
 	/* 使用 responses 端点发送一个最小化的探测请求 */
 	checkURL := hc.baseURL + "/responses"
 	reqBody := `{"model":"gpt-5","input":[{"role":"user","content":"ping"}],"stream":false,"store":false,"max_output_tokens":1,"reasoning":{"effort":"auto"}}`

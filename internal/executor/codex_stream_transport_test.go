@@ -64,6 +64,7 @@ func TestExecuteNonStreamUsesUpstreamSSEAndReturnsChatJSON(t *testing.T) {
 		streamTransportRetryConfig(account),
 		[]byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}],"stream":false}`),
 		"gpt-5.6-sol",
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("ExecuteNonStream() error = %v", err)
@@ -104,6 +105,7 @@ func TestExecuteResponsesNonStreamUsesUpstreamSSEAndReturnsResponseJSON(t *testi
 		streamTransportRetryConfig(account),
 		[]byte(`{"model":"gpt-5.6-sol","input":"hi","stream":false}`),
 		"gpt-5.6-sol",
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("ExecuteResponsesNonStream() error = %v", err)
