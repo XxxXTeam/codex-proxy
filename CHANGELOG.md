@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.13.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.12.0...v1.13.0) (2026-10-01)
+
+
+### ✨ 新功能
+
+* 更换许可证为Apache2.0 ([deb26d3](https://github.com/XxxXTeam/codex-proxy/commit/deb26d376e3be9020244a6d085a87502e6ec3c66))
+* 更新客户端版本至0.153.4 ([83b7b56](https://github.com/XxxXTeam/codex-proxy/commit/83b7b5628224a0d1f8b4541dbfdc884c2f6892aa))
+* 添加新的模型 gpt-6-astra 到模型列表 ([4e27304](https://github.com/XxxXTeam/codex-proxy/commit/4e2730452c2937d401b287e26177b9f1fa174699))
+
+
+### 🐛 错误修复
+
+* 修复claude接口思考转换错误的问题，修复了导致流耗时过长的问题 ([3a99065](https://github.com/XxxXTeam/codex-proxy/commit/3a99065b57ed271bb1ed2e83f091d1529f494f66))
+
 ## [1.12.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.11.0...v1.12.0) (2026-08-19)
 
 
