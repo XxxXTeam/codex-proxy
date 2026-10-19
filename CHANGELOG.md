@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.13.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.12.0...v1.13.0) (2026-10-19)
+
+
+### ✨ 新功能
+
+* 更换许可证为Apache2.0 ([deb26d3](https://github.com/XxxXTeam/codex-proxy/commit/deb26d376e3be9020244a6d085a87502e6ec3c66))
+* 更新客户端版本至0.153.4 ([83b7b56](https://github.com/XxxXTeam/codex-proxy/commit/83b7b5628224a0d1f8b4541dbfdc884c2f6892aa))
+* 更新客户端版本至0.163.0，添加新的模型 gpt-6-sol、gpt-6.1-sol 和 gpt-6-luna ([67b537d](https://github.com/XxxXTeam/codex-proxy/commit/67b537d156dccafcc0864d9c117b8e0302baa46b))
+* 添加新的模型 gpt-6-astra 到模型列表 ([4e27304](https://github.com/XxxXTeam/codex-proxy/commit/4e2730452c2937d401b287e26177b9f1fa174699))
+
+
+### 🐛 错误修复
+
+* 修复claude接口思考转换错误的问题，修复了导致流耗时过长的问题 ([3a99065](https://github.com/XxxXTeam/codex-proxy/commit/3a99065b57ed271bb1ed2e83f091d1529f494f66))
+
+
+### 📦 依赖更新
+
+* **go:** bump github.com/go-sql-driver/mysql from 1.10.0 to 1.10.1 ([#73](https://github.com/XxxXTeam/codex-proxy/issues/73)) ([fd997b0](https://github.com/XxxXTeam/codex-proxy/commit/fd997b050828f68710e7686ab8bdb83d89a414f9))
+* **go:** bump github.com/sirupsen/logrus from 1.10.0 to 1.10.2 ([#71](https://github.com/XxxXTeam/codex-proxy/issues/71)) ([cb47aad](https://github.com/XxxXTeam/codex-proxy/commit/cb47aad2cae1aad9fd01e343e0ab4b5f67371e1c))
+* **go:** bump modernc.org/sqlite from 1.56.0 to 1.60.1 ([#77](https://github.com/XxxXTeam/codex-proxy/issues/77)) ([d1f3806](https://github.com/XxxXTeam/codex-proxy/commit/d1f38066cac6ae8d16161f416187914d17fe86bf))
+* **go:** bump the golang-org-x group across 1 directory with 2 updates ([#74](https://github.com/XxxXTeam/codex-proxy/issues/74)) ([4c8a994](https://github.com/XxxXTeam/codex-proxy/commit/4c8a994cc1850fff27ca57e7f08986c71aa3b037))
+
 ## [1.12.0](https://github.com/XxxXTeam/codex-proxy/compare/v1.11.0...v1.12.0) (2026-08-19)
 
 
