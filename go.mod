@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/fasthttp/router v1.5.4
 	github.com/fasthttp/websocket v1.5.12
-	github.com/go-sql-driver/mysql v1.10.0
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.3
 	github.com/mattn/go-isatty v0.0.24
