@@ -429,6 +429,9 @@ var modelList = []modelListEntry{
 	newModelListEntry("gpt-5.4-mini", []string{"low", "medium", "high", "xhigh", "none", "auto"}),
 	newModelListEntry("gpt-5.5", []string{"none", "minimal", "low", "medium", "high", "xhigh"}),
 	newModelListEntry("gpt-5.6-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
+	newModelListEntry("gpt-6-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
+	newModelListEntry("gpt-6.1-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
+	newModelListEntry("gpt-6-luna", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
 	newModelListEntry("gpt-6-astra", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
 	{
 		base:     "gpt-5.6-sol-openai-compact",
