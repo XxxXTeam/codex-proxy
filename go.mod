@@ -12,7 +12,7 @@ require (
 	github.com/sirupsen/logrus v1.10.2
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
-	github.com/tiktoken-go/tokenizer v0.8.1
+	github.com/tiktoken-go/tokenizer v0.10.0
 	github.com/valyala/fasthttp v1.73.0
 	golang.org/x/net v0.61.0
 	golang.org/x/sync v0.24.0
